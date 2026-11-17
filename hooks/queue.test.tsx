@@ -36,7 +36,7 @@ test('a review goes gray, red, green, then leaves the queue once posted', async 
   }))
   on('clock.every', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
-  on('command.run', { command: 'pr-review-queue' }, (_, e) => {
+  on('command.run', { command: 'pr-review-queue:review' }, (_, e) => {
     started.push(e.args)
     return { text: '' }
   })

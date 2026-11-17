@@ -1,6 +1,6 @@
 {
   "name": "pr-review-queue",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shows the GitHub pull requests waiting on your review above the prompt, and starts a review when you pick one",
   "author": { "name": "wallentx" },
   "repository": "https://github.com/wallentx/pr-review-queue",
@@ -28,7 +28,7 @@
       "type": "string",
       "title": "Review command",
       "description": "The slash command, without its slash, that picking a pull request runs with owner/repo#N as its argument.",
-      "default": "pr-review-queue"
+      "default": "pr-review-queue:review"
     }
   }
 }

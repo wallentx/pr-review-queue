@@ -75,7 +75,7 @@ function configOf(options: Record<string, unknown> | undefined): Config {
     aidPath: text('aidPath', 'AID.review-queue'),
     owner: text('owner', ''),
     workspace: text('workspace', ''),
-    reviewCommand: text('reviewCommand', 'pr-review-queue').replace(/^\//, ''),
+    reviewCommand: text('reviewCommand', 'pr-review-queue:review').replace(/^\//, ''),
   }
 }
 
