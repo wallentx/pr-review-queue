@@ -1,0 +1,5 @@
+{
+  "name": "pr-review-queue",
+  "owner": { "name": "wallentx" },
+  "plugins": [{ "name": "pr-review-queue", "source": "./" }]
+}

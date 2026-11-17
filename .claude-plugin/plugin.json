@@ -1,0 +1,34 @@
+{
+  "name": "pr-review-queue",
+  "version": "0.1.0",
+  "description": "Shows the GitHub pull requests waiting on your review above the prompt, and starts a review when you pick one",
+  "author": { "name": "wallentx" },
+  "repository": "https://github.com/wallentx/pr-review-queue",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "aidPath": {
+      "type": "string",
+      "title": "AID.review-queue command",
+      "description": "The AID.review-queue executable, by name on PATH or as an absolute path.",
+      "default": "AID.review-queue"
+    },
+    "owner": {
+      "type": "string",
+      "title": "GitHub owner",
+      "description": "The organization or user whose pull requests are listed. Empty lets AID.review-queue infer it from its config or the workspace.",
+      "default": ""
+    },
+    "workspace": {
+      "type": "string",
+      "title": "Workspace directory",
+      "description": "An absolute directory AID.review-queue reads git remotes from to infer the owner. Empty uses the session's working directory.",
+      "default": ""
+    },
+    "reviewCommand": {
+      "type": "string",
+      "title": "Review command",
+      "description": "The slash command, without its slash, that picking a pull request runs with owner/repo#N as its argument.",
+      "default": "pr-review-queue"
+    }
+  }
+}
