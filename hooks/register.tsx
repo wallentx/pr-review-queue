@@ -10,6 +10,8 @@ const TICK_MS = 30 * 1000
 const CLAIM_MS = 150 * 1000
 /** How long a claimer waits before reading its claim back, so a racing claim lands first. */
 const CLAIM_SETTLE_MS = 1000
+/** How long a shared file may fail to parse before a session writes over it. */
+const UNREADABLE_MS = 2 * TICK_MS
 const MAX_ROWS = 9
 const COMMAND = 'pr-queue'
 
@@ -120,9 +122,10 @@ let timer: { cancel: () => void } | undefined
 let cachePath: string | undefined
 let lastSeen = 0
 let isTicking = false
+let unreadableSince: number | undefined
 const holder = Math.random().toString(36).slice(2)
 
-/** The shared file's content: `{}` when absent, undefined while another session is mid-write. */
+/** The shared file's content: `{}` when absent, undefined when it does not parse (mid-write, or left truncated). */
 async function readShared($: EngineInterface, path: string): Promise<Shared | undefined> {
   try {
     if (!(await $.fs.exists(path))) return {}
@@ -148,6 +151,12 @@ async function tick($: EngineInterface): Promise<void> {
   isTicking = true
   try {
     await check($)
+  } catch (err) {
+    // A cache directory this session cannot write leaves it checking on its own.
+    const detail = err instanceof Error ? err.message.slice(0, 80) : 'unknown error'
+    cachePath = undefined
+    void $.ui.toast(`The PR review queue cannot use its shared cache (${detail}), so this session checks on its own.`)
+    await poll($)
   } finally {
     isTicking = false
   }
@@ -157,9 +166,16 @@ async function check($: EngineInterface): Promise<void> {
   if (!(await read($, isEnabled))) return
   const path = cachePath
   if (path === undefined) return poll($)
-  const shared = await readShared($, path)
-  if (shared === undefined) return
   const now = await $.clock.now()
+  let shared = await readShared($, path)
+  if (shared === undefined) {
+    // Another session may be mid-write, so wait a while. A file that still does
+    // not parse after that was left truncated, and this session writes over it.
+    unreadableSince ??= now
+    if (now - unreadableSince < UNREADABLE_MS) return
+    shared = {}
+  }
+  unreadableSince = undefined
   if (shared.result && now - (shared.fetchedAt ?? 0) < POLL_MS) {
     if (shared.fetchedAt !== lastSeen) {
       lastSeen = shared.fetchedAt ?? 0
@@ -178,8 +194,15 @@ async function check($: EngineInterface): Promise<void> {
   await apply($, result)
 }
 
-/** A check with no shared file, used when neither XDG_CACHE_HOME nor HOME is set. */
+/**
+ * A check with no shared file, used when neither XDG_CACHE_HOME nor HOME is
+ * set or the cache cannot be written. It runs at most once per POLL_MS,
+ * though the timer fires every TICK_MS.
+ */
 async function poll($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  if (lastSeen !== 0 && now - lastSeen < POLL_MS) return
+  lastSeen = now
   await apply($, await fetchQueue($))
 }
 

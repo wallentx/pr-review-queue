@@ -34,7 +34,7 @@ const queueSwitch = ($: Parameters<Body>[0], args: string) =>
 const CACHE = '/home/me/.cache/pr-review-queue'
 
 /** An in-memory file system and clock standing in for the shared cache file. */
-function sharedCache(on: On, files: Map<string, string> = new Map(), now = 1_000_000) {
+function sharedCache(on: On, files: Map<string, string> = new Map(), clock = { now: 1_000_000 }, isWritable = true) {
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/me' : undefined }))
   on('fs.exists', (_, e) => ({ value: files.has(e.path) }))
   on('fs.read', (_, e) => {
@@ -42,8 +42,12 @@ function sharedCache(on: On, files: Map<string, string> = new Map(), now = 1_000
     if (text === undefined) throw new Error('ENOENT')
     return { value: text }
   })
-  on('fs.write', (_, e) => (files.set(e.path, e.text), { value: undefined }))
-  on('clock.now', () => ({ value: now }))
+  on('fs.write', (_, e) => {
+    if (!isWritable) throw new Error('EACCES')
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('clock.now', () => ({ value: clock.now }))
   on('clock.sleep', () => ({ value: undefined }))
   return files
 }
@@ -233,6 +237,55 @@ test('a session takes over a claim older than the fetch timeout', async ($, on) 
   await settle()
   const path = [...files.keys()][0]!
   files.set(path, JSON.stringify({ claimedBy: 'gone-session', claimedAt: 1_000_000 - 151_000 }))
+  await queueSwitch($, 'off')
+  await queueSwitch($, 'on')
+  await settle()
+  expect(ran.length).toBe(2)
+  expect(onlyFile(files).result.total).toBe(2)
+})
+
+test('a cache directory that cannot be written leaves the session checking on its own', async ($, on) => {
+  const ran: string[][] = []
+  const toasts: string[] = []
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  on('clock.every', () => ({ value: undefined }))
+  on('ui.toast', (_, e) => (toasts.push(String(e.text)), { value: undefined }))
+  sharedCache(on, new Map(), { now: 1_000_000 }, false)
+  on('process.run', (_, e) => (ran.push([...e.argv]), { value: { exitCode: 0, stdout: QUEUE, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await queueSwitch($, 'on')
+  await settle()
+  expect(ran.length).toBe(1)
+  expect(toasts.some(text => text.includes('shared cache'))).toBe(true)
+  const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Reviews waiting: 2/ }))?.text).toBeTruthy()
+  await ui.unmount()
+})
+
+test('a shared file left truncated is written over after a minute', async ($, on) => {
+  const ran: string[][] = []
+  const clock = { now: 1_000_000 }
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  on('clock.every', () => ({ value: undefined }))
+  const files = sharedCache(on, new Map(), clock)
+  on('process.run', (_, e) => (ran.push([...e.argv]), { value: { exitCode: 0, stdout: QUEUE, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  // Learn the file's name from a first fetch, then truncate the file.
+  await queueSwitch($, 'on')
+  await settle()
+  const path = [...files.keys()][0]!
+  files.set(path, '{"fetch')
+  clock.now += 6 * 60_000
+  await queueSwitch($, 'off')
+  await queueSwitch($, 'on')
+  await settle()
+  expect(ran.length).toBe(1)
+
+  clock.now += 61_000
   await queueSwitch($, 'off')
   await queueSwitch($, 'on')
   await settle()
