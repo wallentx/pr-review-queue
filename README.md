@@ -32,26 +32,49 @@ The queue starts off in every session. Run `/pr-queue on` to turn it on and `/pr
 
 Sessions that have the queue on and run the same query share one result. The query is the `aidPath`, `owner` and `workspace` options, plus the session's working directory when `workspace` is empty, because `AID.review-queue` infers the owner from it. The query also covers `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST` and `GH_CONFIG_DIR`, which choose the GitHub account and host, so sessions signed in differently keep separate results. Those values reach the cache only as part of a hash in the file name. The shared result is a file under `${XDG_CACHE_HOME:-~/.cache}/pr-review-queue/`. Each session reads that file every 30 seconds. When the result there is older than 5 minutes, one session claims the next check, runs `AID.review-queue`, and writes the new result, and the other sessions pick it up on their next read. A session that turns the queue on while a recent result exists shows that result at once. A claim lapses after 150 seconds, so a session that exits mid-check does not stall the others. A shared file that still fails to parse after a minute was left truncated, and the next session to check writes over it. When the cache directory cannot be written, or neither `XDG_CACHE_HOME` nor `HOME` is set, the session shows a toast and runs its own check every 5 minutes.
 
-When pull requests are waiting, a row reads `Reviews waiting: N` with a `[ Show ]` button. Click it, or press ctrl+x then Tab to focus the row and press `s`, to show or hide the list. Each line shows one pull request as `owner/repo#N` in fixed colors, followed by its title cut to fit the width. Picking a gray line runs the review command for that pull request.
+When pull requests are waiting, a row reads `◧ Reviews waiting: N` followed by a triangle. The triangle points right while the list is hidden and down while it is shown. Click anywhere on the text or the triangle, or press ctrl+x then Tab to focus it and press Enter, to show or hide the list. Each line shows one pull request as `owner/repo#N` in fixed colors, followed by its title cut to fit the width. Picking a gray line runs the review command for that pull request.
+
+Clicking `◧` opens the list if it is closed, turns it into `◨`, and moves every line to the right to show a red `⨯` at its start. Clicking `◨` again removes the `⨯` marks. Clicking a `⨯` hides that pull request from the list and from the count in every session. Other open sessions pick up the change within 30 seconds.
+
+While `◨` shows and some pull requests are hidden, a green `⟲` appears beside it. Clicking that `⟲` lists the hidden pull requests struck through, each with its own green `⟲` at its start, and clicking a row's `⟲` restores that pull request to the list. A hidden pull request that stops waiting for your review, because you posted one or it was merged or closed, is forgotten after the next complete check of the query that hid it. Sessions with a different owner, workspace, or GitHub account run a different query, so their checks leave it hidden. While the hidden pull requests are listed, they get room first, and the waiting ones fill the rest of the 9 lines. `/pr-queue unhide owner/repo#N` restores one pull request from the prompt, and `/pr-queue unhide` restores them all.
 
 | Marker | Meaning |
 | --- | --- |
-| gray `○` | The pull request waits for review. |
-| red `●` | A review of it is running. |
-| green `●` | The review finished, and its results wait to be posted. |
-| (removed) | The review was posted. |
+| gray `○` | The pull request waits for review. Picking it starts one. |
+| yellow `○` | The review command ran, and no subagent has taken the review yet. |
+| pulsing `●` | A subagent is reviewing it. The dot cycles between yellow and blue while the model reads its input or a tool runs, and between yellow and red while the model writes. |
+| green `●` | The review finished, and its draft waits for you. |
+| red `●` | The review ended in an error or a refusal. Picking it starts another. |
+| blue `✓` | The review was posted. The line stays until a complete check no longer lists the pull request, and it no longer counts as waiting. |
 
 A failed check shows a red line with the reason, so a failure never reads as an empty queue.
 
+## Choice buttons
+
+After the agent drafts a review, it calls the `offer_choices` tool, which the mod registers, to put buttons after `owner/repo#N`, such as `[✓] [✓🗩 ] [⊘]`. The brackets are light blue. Each button shows one or two glyphs from a fixed palette of GitHub review actions, and the agent writes what each button does for that review. Two glyphs combine actions, so `✓🗩` approves with comments. Clicking a button sends its action to the agent as your own message, starting with its glyph, and removes the buttons. Posting a review also removes them. You can still type an answer instead. Offering buttons opens a collapsed list. When the pull request is hidden or falls past the 9 lines the list draws, the tool tells the agent that the buttons are not visible, and the agent asks you in words.
+
+| Glyph | Usual meaning |
+| --- | --- |
+| green `✓` | Approve. |
+| `🗩` | Comment. |
+| `🗈` | Post suggested changes. |
+| red `⊘` | Request changes. |
+
+The meanings guide the agent and are not enforced. The mod refuses a glyph outside the palette, or more than two glyphs on one button. Most fonts draw `🗩` and `🗈` two cells wide, so each is followed by a space for it to spill into.
+
 ## Review command
 
-`/pr-review-queue:review owner/repo#N` collects the pull request's evidence with `AID.pr`, starts one subagent to review the diff, and shows you a draft review. It posts nothing until you approve the draft, and it then submits the review with `gh pr review`. You can also type the command yourself for a pull request that is not in the queue.
+`/pr-review-queue:review owner/repo#N` collects the pull request's evidence with `AID.pr`, starts one subagent to review the diff, and shows you a draft review with choice buttons on its line. It posts nothing until you pick a button or answer in words. It then submits the review with `gh pr review`, or with a `gh api` POST when the review has inline comments. You can also type the command yourself for a pull request that is not in the queue.
 
-To use your own command, set `reviewCommand` to its name without the slash. The status markers below depend on what that command does, so a replacement needs to start a subagent with `owner/repo#N` in its prompt and post with `gh pr review` for the line to turn green and then disappear.
+To use your own command, set `reviewCommand` to its name without the slash. The status markers below depend on what that command does, so a replacement needs to start a subagent with `owner/repo#N` in its prompt and post with `gh pr review` or a `gh api` POST to the pull request's reviews for the line to pulse, turn green, and then show a check.
 
 ## Status tracking
 
-A line turns red when the review command runs with `owner/repo#N` in its arguments, whether you picked the line or typed the command. It turns green when a subagent whose prompt contains `owner/repo#N` finishes. It disappears when a Bash call of `gh pr review N --repo owner/repo` with `--approve`, `--request-changes`, or `--comment` succeeds. A posted pull request stays hidden until a later check no longer lists it, and a new review request after that shows it gray again.
+A line turns yellow when the review command runs with `owner/repo#N` in its arguments, whether you picked the line or typed the command. The main turn whose prompt names `owner/repo#N` is that review's own turn. When a subagent whose prompt contains `owner/repo#N` starts, the line becomes that subagent's, and its dot pulses until the subagent's turn ends.
+
+How the turn ends sets the dot. An answer turns it green, an error or a refusal turns it red, and ctrl+c turns it gray again so the line can be picked again. When the review's own main turn ends before any subagent started, the same rule applies, so a review the model did in the main conversation turns green. Each queue check and every 2 seconds of pulsing also compare the tracked subagents with the engine's agent list, so a subagent that was killed or vanished without an event still turns its dot gray.
+
+A line turns into a blue check when a Bash call that posts a review succeeds: `gh pr review N --repo owner/repo` with `--approve`, `--request-changes`, or `--comment`, or a `gh api` POST to `repos/owner/repo/pulls/N/reviews`. The line stays listed until a later complete check no longer lists the pull request.
 
 ## Options
 
