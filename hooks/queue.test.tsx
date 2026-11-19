@@ -325,7 +325,7 @@ test('sessions signed in to GitHub differently keep separate results', async ($,
   for (const text of files.values()) expect(text.includes('account')).toBe(false)
 })
 
-test('the triangle shows the list, the dot reveals the hide control, and unhide brings rows back', async ($, on) => {
+test('the square edits the list: the cross hides a row, the eye lists hidden rows, the arrow restores one', async ($, on) => {
   const store = new Map<string, unknown>()
   on('command.register', () => ({ value: { command: 'pr-queue' } }))
   on('clock.every', () => ({ value: undefined }))
@@ -338,36 +338,81 @@ test('the triangle shows the list, the dot reveals the hide control, and unhide 
   await queueSwitch($, 'on')
   await settle()
   const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
+  const HIDE_A = 'hide-FarmGPU/fgpu_ansible#207'
+  const HIDE_B = 'hide-FarmGPU/onepass-client#31'
+  const RESTORE_A = 'restore-FarmGPU/fgpu_ansible#207'
 
-  // Collapsed, the header ends in a right triangle; expanded, a down triangle.
-  // The whole line is one button.
+  // Collapsed: a half-filled square, then the count and a right triangle.
+  expect(await ui.find({ type: 'Text', text: '◧' })).toBeTruthy()
   expect(await ui.find({ type: 'Text', text: '▶' })).toBeTruthy()
-  expect((await ui.find({ type: 'Button', key: 'toggle' }))?.props?.label).toBe('Show the list')
-  await ui.press({ key: 'toggle' })
+
+  // The square expands the list and puts a cross on every row.
+  await ui.press({ key: 'edit' })
+  expect(await ui.find({ type: 'Text', text: '□' })).toBeTruthy()
   expect(await ui.find({ type: 'Text', text: '▼' })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: '▶' })).toBeFalsy()
+  expect(await ui.find({ type: 'Button', key: HIDE_A })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: HIDE_B })).toBeTruthy()
+  // No pull request is hidden yet, so there is no eye.
+  expect(await ui.find({ type: 'Button', key: 'show-hidden' })).toBeFalsy()
 
-  // The dot reveals [x] on its own row only, and a second press hides it again.
-  expect(await ui.find({ type: 'Button', key: 'hide-FarmGPU/fgpu_ansible#207' })).toBeFalsy()
-  await ui.press({ key: 'dot-FarmGPU/fgpu_ansible#207' })
-  expect(await ui.find({ type: 'Button', key: 'hide-FarmGPU/fgpu_ansible#207' })).toBeTruthy()
-  expect(await ui.find({ type: 'Button', key: 'hide-FarmGPU/onepass-client#31' })).toBeFalsy()
-  await ui.press({ key: 'dot-FarmGPU/fgpu_ansible#207' })
-  expect(await ui.find({ type: 'Button', key: 'hide-FarmGPU/fgpu_ansible#207' })).toBeFalsy()
+  // The square again removes the crosses and keeps the list open.
+  await ui.press({ key: 'edit' })
+  expect(await ui.find({ type: 'Button', key: HIDE_A })).toBeFalsy()
+  expect(await ui.find({ type: 'Button', key: A })).toBeTruthy()
 
-  // The x hides the row, drops it from the count, and keeps it hidden in the store.
-  await ui.press({ key: 'dot-FarmGPU/fgpu_ansible#207' })
-  await ui.press({ key: 'hide-FarmGPU/fgpu_ansible#207' })
+  // A cross hides its row in the store and drops it from the count.
+  await ui.press({ key: 'edit' })
+  await ui.press({ key: HIDE_A })
   expect(await ui.find({ type: 'Button', key: A })).toBeFalsy()
-  expect(await ui.find({ type: 'Button', key: B })).toBeTruthy()
   expect((await ui.find({ type: 'Text', text: /Reviews waiting: 1/ }))?.text).toBeTruthy()
   expect(store.get('hiddenRefs')).toEqual(['FarmGPU/fgpu_ansible#207'])
 
-  // Unhide brings it back.
-  const answer = (await queueSwitch($, 'unhide')) as { text: string }
-  expect(answer.text).toBe('1 hidden pull request is shown again.')
+  // The eye lists hidden rows struck through, each with a restore arrow.
+  await ui.press({ key: 'show-hidden' })
+  const restore = await ui.find({ type: 'Button', key: RESTORE_A })
+  expect(restore).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: '↺' })).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: 'fgpu_ansible' }))?.props?.strikethrough).toBe(true)
+
+  // The arrow restores the row to the regular list.
+  await ui.press({ key: RESTORE_A })
   expect(await ui.find({ type: 'Button', key: A })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: RESTORE_A })).toBeFalsy()
+  expect(await ui.find({ type: 'Button', key: 'show-hidden' })).toBeFalsy()
+  expect((await ui.find({ type: 'Text', text: /Reviews waiting: 2/ }))?.text).toBeTruthy()
   expect(store.get('hiddenRefs')).toEqual([])
+  await ui.unmount()
+})
+
+test('a hidden pull request that stops waiting for review is forgotten', async ($, on) => {
+  const store = new Map<string, unknown>([['hiddenRefs', ['FarmGPU/fgpu_ansible#207', 'acme/gone#9']]])
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  on('clock.every', () => ({ value: undefined }))
+  sharedCache(on, new Map(), { now: 1_000_000 }, true, {}, store)
+  on('process.run', () => ({ value: { exitCode: 0, stdout: QUEUE, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await queueSwitch($, 'on')
+  await settle()
+  expect(store.get('hiddenRefs')).toEqual(['FarmGPU/fgpu_ansible#207'])
+})
+
+test('a queue whose every pull request is hidden still draws its line', async ($, on) => {
+  const store = new Map<string, unknown>([['hiddenRefs', ['FarmGPU/fgpu_ansible#207', 'FarmGPU/onepass-client#31']]])
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  on('clock.every', () => ({ value: undefined }))
+  sharedCache(on, new Map(), { now: 1_000_000 }, true, {}, store)
+  on('process.run', () => ({ value: { exitCode: 0, stdout: QUEUE, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await queueSwitch($, 'on')
+  await settle()
+  const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Reviews waiting: 0/ }))?.text).toBeTruthy()
+  await ui.press({ key: 'edit' })
+  expect(await ui.find({ type: 'Button', key: 'show-hidden' })).toBeTruthy()
   await ui.unmount()
 })
 

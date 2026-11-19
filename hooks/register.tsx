@@ -22,7 +22,8 @@ const queue = atom({ plugin: 'pr-review-queue', key: 'queue' } as const, null, {
 const statuses = atom({ plugin: 'pr-review-queue', key: 'statuses' } as const, {}, { shape: 'statuses-1' })
 const agents = atom({ plugin: 'pr-review-queue', key: 'agents' } as const, {}, { shape: 'agents-1' })
 const hiddenAtom = atom({ plugin: 'pr-review-queue', key: 'hidden' } as const, [], { shape: 'hidden-1' })
-const revealed = atom({ plugin: 'pr-review-queue', key: 'revealed' } as const, null)
+const isEditing = atom({ plugin: 'pr-review-queue', key: 'isEditing' } as const, false)
+const isShowingHidden = atom({ plugin: 'pr-review-queue', key: 'isShowingHidden' } as const, false)
 const HIDDEN_KEY = 'hiddenRefs'
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
@@ -169,6 +170,14 @@ async function saveHidden($: EngineInterface, refs: string[]): Promise<void> {
   await update($, hiddenAtom, () => refs)
 }
 
+/** Hides or restores one pull request in every session. */
+async function setHidden($: EngineInterface, ref: string, isHidden: boolean): Promise<void> {
+  const stored = await $.store.get(HIDDEN_KEY)
+  const before = Array.isArray(stored) ? stored.filter((r): r is string => typeof r === 'string') : []
+  const rest = before.filter(r => r !== ref)
+  await saveHidden($, isHidden ? [...rest, ref] : rest)
+}
+
 async function tick($: EngineInterface): Promise<void> {
   await loadHidden($)
   // A fetch can outlast TICK_MS, and the claim already names this session, so
@@ -269,6 +278,12 @@ async function apply($: EngineInterface, result: Queue): Promise<void> {
     await update($, statuses, all =>
       Object.fromEntries(Object.entries(all).filter(([ref]) => listed.has(ref))),
     )
+    // A hidden pull request that no longer waits on a review (reviewed, merged,
+    // closed) is forgotten. Only a complete list proves it is gone.
+    if (result.isComplete) {
+      const kept = (await read($, hiddenAtom)).filter(ref => listed.has(ref))
+      if (kept.length !== (await read($, hiddenAtom)).length) await saveHidden($, kept)
+    }
   }
 }
 
@@ -412,28 +427,71 @@ export const register: Register = (on, options) => {
 
     const status = await read($, statuses)
     const hiddenRefs = new Set(await read($, hiddenAtom))
-    const visible = q.items.filter(item => status[refOf(item)] !== 'posted' && !hiddenRefs.has(refOf(item)))
-    const hidden = q.items.length - visible.length
-    const total = Math.max(0, q.total - hidden)
-    if (total === 0) {
+    const listed = q.items.filter(item => status[refOf(item)] !== 'posted')
+    const visible = listed.filter(item => !hiddenRefs.has(refOf(item)))
+    const hiddenItems = listed.filter(item => hiddenRefs.has(refOf(item)))
+    const total = Math.max(0, q.total - (q.items.length - visible.length))
+    // A queue whose every pull request is hidden still draws its line, so the
+    // hidden ones can be brought back.
+    if (total === 0 && hiddenItems.length === 0) {
       return next(e)
     }
 
     const expanded = await read($, isExpanded)
+    const editing = await read($, isEditing)
+    const showingHidden = editing && hiddenItems.length > 0 && (await read($, isShowingHidden))
+
     const header = (
-      // The whole line is the toggle, so a click anywhere on it shows or hides the list.
-      <Button
-        key="toggle"
-        label={expanded ? 'Hide the list' : 'Show the list'}
-        plain
-        onPress={() => update($, isExpanded, v => !v)}
-      >
-        <Text color="warning">
-          Reviews waiting: {total}
-          {q.isComplete ? '' : ' (partial)'}{' '}
-        </Text>
-        <Text>{expanded ? '▼' : '▶'}</Text>
-      </Button>
+      <Box flexDirection="row">
+        <Button
+          key="edit"
+          label={editing ? 'Stop editing the list' : 'Edit the list'}
+          plain
+          onPress={async () => {
+            if (editing) {
+              await update($, isEditing, () => false)
+              await update($, isShowingHidden, () => false)
+              return
+            }
+            await update($, isEditing, () => true)
+            await update($, isExpanded, () => true)
+          }}
+        >
+          <Text>{editing ? '□' : '◧'}</Text>
+        </Button>
+        {editing && hiddenItems.length > 0 ? (
+          <Button
+            key="show-hidden"
+            label={showingHidden ? 'Stop showing hidden pull requests' : 'Show hidden pull requests'}
+            plain
+            onPress={() => update($, isShowingHidden, v => !v)}
+          >
+            {' '}
+            <Text>👁</Text>
+          </Button>
+        ) : null}
+        {/* The rest of the line is the toggle, so a click anywhere on it shows or hides the list. */}
+        <Button
+          key="toggle"
+          label={expanded ? 'Hide the list' : 'Show the list'}
+          plain
+          onPress={async () => {
+            // Collapsing the list also leaves editing, since its controls are on the rows.
+            if (expanded) {
+              await update($, isEditing, () => false)
+              await update($, isShowingHidden, () => false)
+            }
+            await update($, isExpanded, v => !v)
+          }}
+        >
+          {' '}
+          <Text color="warning">
+            Reviews waiting: {total}
+            {q.isComplete ? '' : ' (partial)'}{' '}
+          </Text>
+          <Text>{expanded ? '▼' : '▶'}</Text>
+        </Button>
+      </Box>
     )
 
     if (!expanded) {
@@ -442,72 +500,75 @@ export const register: Register = (on, options) => {
 
     const columns = e.props.bodyColumns > 0 ? e.props.bodyColumns : 80
     const rows = visible.slice(0, MAX_ROWS)
-    const open = await read($, revealed)
+    const hiddenRows = showingHidden ? hiddenItems.slice(0, Math.max(0, MAX_ROWS - rows.length)) : []
+    const notShown = visible.length - rows.length + (showingHidden ? hiddenItems.length - hiddenRows.length : 0)
+
+    /** A row's text: marker, `owner/repo#N` in fixed colors, and the title cut to the room left. */
+    const body = (item: QueueItem, isHidden: boolean) => {
+      const ref = refOf(item)
+      const state = status[ref]
+      const [org, repo] = item.repo.split('/')
+      // Marker and spaces take 3 columns, the edit control 2 more; one more keeps the row off the last column.
+      const room = columns - 4 - (editing ? 2 : 0) - Array.from(ref).length
+      const title = room >= 8 ? fit(item.title, room) : ''
+      // A hidden row is struck through and dim in every part.
+      const strike = isHidden ? { strikethrough: true, dimColor: true } : {}
+      // An array, since a Button holds strings and Text only, never a fragment's Box.
+      return [
+        <Text key="marker" {...strike} color={state === 'running' ? 'error' : state === 'done' ? 'success' : 'inactive'}>
+          {state === undefined ? '○' : '●'}
+        </Text>,
+        <Text key="gap" {...strike}> </Text>,
+        <Text key="org" {...strike} color="suggestion">{org}</Text>,
+        <Text key="slash" {...strike} dimColor>/</Text>,
+        <Text key="repo" {...strike} color="claude">{repo}</Text>,
+        <Text key="number" {...strike} color="warning">#{item.number}</Text>,
+        title ? <Text key="title" {...strike}> {title}</Text> : null,
+      ]
+    }
+
     return (
       <Box flexDirection="column">
         {header}
         {rows.map(item => {
           const ref = refOf(item)
           const state = status[ref]
-          const [org, repo] = item.repo.split('/')
-          const isOpen = open === ref
-          // Marker and spaces take 3 columns, `[x] ` 4 more; one more keeps the row off the last column.
-          const room = columns - 4 - (isOpen ? 4 : 0) - Array.from(ref).length
-          const title = room >= 8 ? fit(item.title, room) : ''
           return (
             <Box key={`row-${ref}`} flexDirection="row">
-              {isOpen ? (
-                <Button
-                  key={`hide-${ref}`}
-                  plain
-                  label="x"
-                  onPress={async () => {
-                    const stored = await $.store.get(HIDDEN_KEY)
-                    const before = Array.isArray(stored) ? stored.filter((r): r is string => typeof r === 'string') : []
-                    await saveHidden($, before.includes(ref) ? before : [...before, ref])
-                    await update($, revealed, () => null)
-                  }}
-                >
-                  <Text color="suggestion">[</Text>
-                  <Text color="error">x</Text>
-                  <Text color="suggestion">]</Text>{' '}
+              {editing ? (
+                <Button key={`hide-${ref}`} label={`Hide ${ref}`} plain onPress={() => setHidden($, ref, true)}>
+                  <Text color="error">⨯</Text>{' '}
                 </Button>
               ) : null}
               <Button
-                key={`dot-${ref}`}
+                key={`pr-${ref}`}
                 plain
-                label={state === undefined ? '○' : '●'}
-                onPress={() => update($, revealed, current => (current === ref ? null : ref))}
+                onPress={async () => {
+                  if (state !== undefined) return
+                  await markRunning($, [ref])
+                  // The command queues a model turn that outlasts the press budget, so it is not awaited.
+                  void $.command.run({ command: config.reviewCommand, args: ref }).catch(err =>
+                    $.ui.toast(`Could not start the review of ${ref}: ${err instanceof Error ? err.message.slice(0, 80) : 'unknown error'}`),
+                  )
+                }}
               >
-                <Text color={state === 'running' ? 'error' : state === 'done' ? 'success' : 'inactive'}>
-                  {state === undefined ? '○' : '●'}
-                </Text>
+                {body(item, false)}
               </Button>
-            <Button
-              key={`pr-${ref}`}
-              plain
-              onPress={async () => {
-                if (state !== undefined) return
-                await markRunning($, [ref])
-                // The command queues a model turn that outlasts the press budget, so it is not awaited.
-                void $.command.run({ command: config.reviewCommand, args: ref }).catch(err =>
-                  $.ui.toast(`Could not start the review of ${ref}: ${err instanceof Error ? err.message.slice(0, 80) : 'unknown error'}`),
-                )
-              }}
-            >
-              {' '}
-              <Text color="suggestion">{org}</Text>
-              <Text dimColor>/</Text>
-              <Text color="claude">{repo}</Text>
-              <Text color="warning">#{item.number}</Text>
-              {title ? ` ${title}` : ''}
-            </Button>
             </Box>
           )
         })}
-        {visible.length > rows.length ? (
-          <Text dimColor>{visible.length - rows.length} more are not shown.</Text>
-        ) : null}
+        {hiddenRows.map(item => {
+          const ref = refOf(item)
+          return (
+            <Box key={`hidden-row-${ref}`} flexDirection="row">
+              <Button key={`restore-${ref}`} label={`Restore ${ref}`} plain onPress={() => setHidden($, ref, false)}>
+                <Text color="success">↺</Text>{' '}
+              </Button>
+              {body(item, true)}
+            </Box>
+          )
+        })}
+        {notShown > 0 ? <Text dimColor>{notShown} more are not shown.</Text> : null}
       </Box>
     )
   })

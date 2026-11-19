@@ -22,8 +22,10 @@ declare module 'claude-code' {
       agents: Shaped<Record<string, string>>
       /** Pull requests the person hid with the row's x, as `owner/repo#N`; also kept in the store. */
       hidden: Shaped<string[]>
-      /** The pull request whose row shows its hide control, or null for none. */
-      revealed: string | null
+      /** Whether the rows show their hide control (the header's square). */
+      isEditing: boolean
+      /** Whether hidden pull requests are listed, struck through, with a restore control. */
+      isShowingHidden: boolean
     }
   }
 }
