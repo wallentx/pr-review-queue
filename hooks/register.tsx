@@ -105,12 +105,20 @@ function hashOf(text: string): string {
 /**
  * The file every session running the same query shares. AID.review-queue infers
  * the owner from the working directory when no workspace is set, so that
- * directory is part of the query.
+ * directory is part of the query. The variables gh reads to pick the GitHub
+ * account and host are part of it too, so sessions signed in differently never
+ * share a result. They reach the file name only through the hash.
  */
 async function cachePathOf($: EngineInterface, cwd: string): Promise<string | undefined> {
   const base = (await $.env.get('XDG_CACHE_HOME')) || ((h => (h ? `${h}/.cache` : undefined))(await $.env.get('HOME')))
   if (!base) return undefined
-  const query = JSON.stringify([queueArgv(config), config.workspace || cwd])
+  const identity = [
+    await $.env.get('GH_TOKEN'),
+    await $.env.get('GITHUB_TOKEN'),
+    await $.env.get('GH_HOST'),
+    await $.env.get('GH_CONFIG_DIR'),
+  ]
+  const query = JSON.stringify([queueArgv(config), config.workspace || cwd, identity])
   return `${base}/pr-review-queue/queue-${hashOf(query)}.json`
 }
 

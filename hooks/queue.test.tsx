@@ -34,8 +34,14 @@ const queueSwitch = ($: Parameters<Body>[0], args: string) =>
 const CACHE = '/home/me/.cache/pr-review-queue'
 
 /** An in-memory file system and clock standing in for the shared cache file. */
-function sharedCache(on: On, files: Map<string, string> = new Map(), clock = { now: 1_000_000 }, isWritable = true) {
-  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/me' : undefined }))
+function sharedCache(
+  on: On,
+  files: Map<string, string> = new Map(),
+  clock = { now: 1_000_000 },
+  isWritable = true,
+  env: Record<string, string> = {},
+) {
+  on('env.get', (_, e) => ({ value: { HOME: '/home/me', ...env }[e.name] }))
   on('fs.exists', (_, e) => ({ value: files.has(e.path) }))
   on('fs.read', (_, e) => {
     const text = files.get(e.path)
@@ -291,4 +297,28 @@ test('a shared file left truncated is written over after a minute', async ($, on
   await settle()
   expect(ran.length).toBe(2)
   expect(onlyFile(files).result.total).toBe(2)
+})
+
+test('sessions signed in to GitHub differently keep separate results', async ($, on) => {
+  const ran: string[][] = []
+  const env: Record<string, string> = { GH_TOKEN: 'first-account' }
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  on('clock.every', () => ({ value: undefined }))
+  const files = sharedCache(on, new Map(), { now: 1_000_000 }, true, env)
+  on('process.run', (_, e) => (ran.push([...e.argv]), { value: { exitCode: 0, stdout: QUEUE, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await queueSwitch($, 'on')
+  await settle()
+
+  // The same mod started again under another token picks another file and fetches its own result.
+  env.GH_TOKEN = 'second-account'
+  await queueSwitch($, 'off')
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await queueSwitch($, 'on')
+  await settle()
+  expect(ran.length).toBe(2)
+  expect(files.size).toBe(2)
+  for (const text of files.values()) expect(text.includes('account')).toBe(false)
 })
