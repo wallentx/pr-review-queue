@@ -31,6 +31,12 @@ const HIDDEN_KEY = 'hiddenRefs'
  * since a terminal shrinks a glyph whose next cell is not a plain space.
  */
 const RESTORE = '⟲'
+/**
+ * Keeps a button's colors while the pointer is over its row, where the
+ * terminal would otherwise invert it. Hover overrides need a keyed Box around
+ * the button, so the header and every row are keyed.
+ */
+const NO_HOVER = { inverse: false } as const
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const REF_RE = /([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:#|\/pull\/)(\d+)/g
@@ -448,11 +454,12 @@ export const register: Register = (on, options) => {
     const showingHidden = editing && hiddenItems.length > 0 && (await read($, isShowingHidden))
 
     const header = (
-      <Box flexDirection="row">
+      <Box key="header" flexDirection="row">
         <Button
           key="edit"
           label={editing ? 'Stop editing the list' : 'Edit the list'}
           plain
+          hover={NO_HOVER}
           onPress={async () => {
             if (editing) {
               await update($, isEditing, () => false)
@@ -471,6 +478,7 @@ export const register: Register = (on, options) => {
             key="show-hidden"
             label={showingHidden ? 'Stop showing hidden pull requests' : 'Show hidden pull requests'}
             plain
+            hover={NO_HOVER}
             onPress={() => update($, isShowingHidden, v => !v)}
           >
             <Text color="success" bold>{RESTORE}</Text>
@@ -482,6 +490,7 @@ export const register: Register = (on, options) => {
           key="toggle"
           label={expanded ? 'Hide the list' : 'Show the list'}
           plain
+          hover={NO_HOVER}
           onPress={async () => {
             // Collapsing the list also leaves editing, since its controls are on the rows.
             if (expanded) {
@@ -542,7 +551,7 @@ export const register: Register = (on, options) => {
           return (
             <Box key={`row-${ref}`} flexDirection="row">
               {editing ? (
-                <Button key={`hide-${ref}`} label={`Hide ${ref}`} plain onPress={() => setHidden($, ref, true)}>
+                <Button key={`hide-${ref}`} label={`Hide ${ref}`} plain hover={NO_HOVER} onPress={() => setHidden($, ref, true)}>
                   <Text color="error">⨯</Text>
                 </Button>
               ) : null}
@@ -550,6 +559,7 @@ export const register: Register = (on, options) => {
               <Button
                 key={`pr-${ref}`}
                 plain
+                hover={NO_HOVER}
                 onPress={async () => {
                   if (state !== undefined) return
                   await markRunning($, [ref])
@@ -568,7 +578,7 @@ export const register: Register = (on, options) => {
           const ref = refOf(item)
           return (
             <Box key={`hidden-row-${ref}`} flexDirection="row">
-              <Button key={`restore-${ref}`} label={`Restore ${ref}`} plain onPress={() => setHidden($, ref, false)}>
+              <Button key={`restore-${ref}`} label={`Restore ${ref}`} plain hover={NO_HOVER} onPress={() => setHidden($, ref, false)}>
                 <Text color="success" bold>{RESTORE}</Text>
               </Button>
               <Text key="restore-gap"> </Text>
