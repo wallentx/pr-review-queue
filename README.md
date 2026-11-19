@@ -36,7 +36,7 @@ When pull requests are waiting, a row reads `◧ Reviews waiting: N` followed by
 
 Clicking `◧` opens the list if it is closed, turns the square into `□`, and moves every line to the right to show a red `⨯` at its start. Clicking `□` again removes the `⨯` marks. Clicking a `⨯` hides that pull request from the list and from the count in every session. Other open sessions pick up the change within 30 seconds.
 
-While `□` shows and some pull requests are hidden, `⟲` appears beside it. Clicking that `⟲` lists the hidden pull requests struck through, each with a green `⟲` at its start, and clicking a green `⟲` restores that pull request to the list. A hidden pull request that stops waiting for your review, because you posted one or it was merged or closed, is forgotten after the next complete check. `/pr-queue unhide owner/repo#N` restores one pull request from the prompt, and `/pr-queue unhide` restores them all.
+While `□` shows and some pull requests are hidden, a green `⟲` appears beside it. Clicking that `⟲` lists the hidden pull requests struck through, each with its own green `⟲` at its start, and clicking a row's `⟲` restores that pull request to the list. A hidden pull request that stops waiting for your review, because you posted one or it was merged or closed, is forgotten after the next complete check. `/pr-queue unhide owner/repo#N` restores one pull request from the prompt, and `/pr-queue unhide` restores them all.
 
 | Marker | Meaning |
 | --- | --- |

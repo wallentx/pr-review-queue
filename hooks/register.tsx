@@ -473,7 +473,7 @@ export const register: Register = (on, options) => {
             plain
             onPress={() => update($, isShowingHidden, v => !v)}
           >
-            <Text>{RESTORE}</Text>
+            <Text color="success" bold>{RESTORE}</Text>
           </Button>
         ) : null}
         {editing && hiddenItems.length > 0 ? <Text key="show-hidden-gap"> </Text> : null}
@@ -569,7 +569,7 @@ export const register: Register = (on, options) => {
           return (
             <Box key={`hidden-row-${ref}`} flexDirection="row">
               <Button key={`restore-${ref}`} label={`Restore ${ref}`} plain onPress={() => setHidden($, ref, false)}>
-                <Text color="success">{RESTORE}</Text>
+                <Text color="success" bold>{RESTORE}</Text>
               </Button>
               <Text key="restore-gap"> </Text>
               {body(item, true)}

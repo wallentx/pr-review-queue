@@ -384,7 +384,9 @@ test('the square edits the list: the cross hides a row, the circle arrow lists h
   await ui.press({ key: 'show-hidden' })
   const restore = await ui.find({ type: 'Button', key: RESTORE_A })
   expect(restore).toBeTruthy()
-  expect(await ui.findAll({ type: 'Text', text: '⟲' })).toHaveLength(2)
+  const arrows = await ui.findAll({ type: 'Text', text: '⟲' })
+  expect(arrows).toHaveLength(2)
+  for (const arrow of arrows) expect(arrow.props).toMatchObject({ color: 'success', bold: true })
   expect((await linesOf(ui)).some(line => line.startsWith('⟲ ○ FarmGPU/fgpu_ansible#207'))).toBe(true)
   expect((await ui.find({ type: 'Text', text: 'fgpu_ansible' }))?.props?.strikethrough).toBe(true)
 
