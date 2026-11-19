@@ -333,7 +333,7 @@ test('sessions signed in to GitHub differently keep separate results', async ($,
   for (const text of files.values()) expect(text.includes('account')).toBe(false)
 })
 
-test('the square edits the list: the cross hides a row, the eye lists hidden rows, the arrow restores one', async ($, on) => {
+test('the square edits the list: the cross hides a row, the circle arrow lists hidden rows and restores one', async ($, on) => {
   const store = new Map<string, unknown>()
   on('command.register', () => ({ value: { command: 'pr-queue' } }))
   on('clock.every', () => ({ value: undefined }))
@@ -360,7 +360,7 @@ test('the square edits the list: the cross hides a row, the eye lists hidden row
   expect(await ui.find({ type: 'Text', text: '▼' })).toBeTruthy()
   expect(await ui.find({ type: 'Button', key: HIDE_A })).toBeTruthy()
   expect(await ui.find({ type: 'Button', key: HIDE_B })).toBeTruthy()
-  // No pull request is hidden yet, so there is no eye.
+  // No pull request is hidden yet, so the header has no arrow.
   expect(await ui.find({ type: 'Button', key: 'show-hidden' })).toBeFalsy()
 
   // The square again removes the crosses and keeps the list open.
@@ -375,18 +375,17 @@ test('the square edits the list: the cross hides a row, the eye lists hidden row
   expect((await ui.find({ type: 'Text', text: /Reviews waiting: 1/ }))?.text).toBeTruthy()
   expect(store.get('hiddenRefs')).toEqual(['FarmGPU/fgpu_ansible#207'])
 
-  // The eye is drawn in its two-column emoji form, and a plain space follows each one-column glyph.
-  expect(await ui.find({ type: 'Text', text: '\u{1F441}\u{FE0F}' })).toBeTruthy()
+  // A plain space follows each control glyph.
   const lines = await linesOf(ui)
-  expect(lines[0]).toStartWith('□ \u{1F441}\u{FE0F} Reviews waiting: 1')
+  expect(lines[0]).toStartWith('□ ⟲ Reviews waiting: 1')
   expect(lines[1]).toStartWith('⨯ ○ ')
 
-  // The eye lists hidden rows struck through, each with a restore arrow.
+  // The header's arrow lists hidden rows struck through, each with its own green arrow.
   await ui.press({ key: 'show-hidden' })
   const restore = await ui.find({ type: 'Button', key: RESTORE_A })
   expect(restore).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: '↺' })).toBeTruthy()
-  expect((await linesOf(ui)).some(line => line.startsWith('↺ ○ FarmGPU/fgpu_ansible#207'))).toBe(true)
+  expect(await ui.findAll({ type: 'Text', text: '⟲' })).toHaveLength(2)
+  expect((await linesOf(ui)).some(line => line.startsWith('⟲ ○ FarmGPU/fgpu_ansible#207'))).toBe(true)
   expect((await ui.find({ type: 'Text', text: 'fgpu_ansible' }))?.props?.strikethrough).toBe(true)
 
   // The arrow restores the row to the regular list.

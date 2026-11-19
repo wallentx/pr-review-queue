@@ -26,12 +26,11 @@ const isEditing = atom({ plugin: 'pr-review-queue', key: 'isEditing' } as const,
 const isShowingHidden = atom({ plugin: 'pr-review-queue', key: 'isShowingHidden' } as const, false)
 const HIDDEN_KEY = 'hiddenRefs'
 /**
- * The eye with U+FE0F, which asks for its two-column emoji form. Without it a
- * terminal draws the one-column text form, which shrinks when the next cell is
- * not a plain space. The other glyphs have no emoji form, so each is followed
- * by a Text holding one plain space, outside its button, which the layout keeps.
+ * The glyph that lists hidden pull requests and restores one. Each control
+ * glyph is followed by a Text holding one plain space, outside its button,
+ * since a terminal shrinks a glyph whose next cell is not a plain space.
  */
-const EYE = '\u{1F441}\u{FE0F}'
+const RESTORE = '⟲'
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const REF_RE = /([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:#|\/pull\/)(\d+)/g
@@ -474,10 +473,10 @@ export const register: Register = (on, options) => {
             plain
             onPress={() => update($, isShowingHidden, v => !v)}
           >
-            <Text>{EYE}</Text>
+            <Text>{RESTORE}</Text>
           </Button>
         ) : null}
-        {editing && hiddenItems.length > 0 ? <Text key="eye-gap"> </Text> : null}
+        {editing && hiddenItems.length > 0 ? <Text key="show-hidden-gap"> </Text> : null}
         {/* The rest of the line is the toggle, so a click anywhere on it shows or hides the list. */}
         <Button
           key="toggle"
@@ -570,7 +569,7 @@ export const register: Register = (on, options) => {
           return (
             <Box key={`hidden-row-${ref}`} flexDirection="row">
               <Button key={`restore-${ref}`} label={`Restore ${ref}`} plain onPress={() => setHidden($, ref, false)}>
-                <Text color="success">↺</Text>
+                <Text color="success">{RESTORE}</Text>
               </Button>
               <Text key="restore-gap"> </Text>
               {body(item, true)}
