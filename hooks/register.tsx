@@ -64,12 +64,10 @@ const MAX_CHOICES = 5
  * it one, so a plain space follows it for the glyph to spill into.
  */
 const PALETTE: Record<string, { color?: string; isWide?: boolean; means: string }> = {
-  '✓': { color: 'success', means: 'approve, accept, or go ahead' },
-  '🗩': { isWide: true, means: 'comment or reply' },
-  '🗈': { isWide: true, means: 'a note, a suggested change, or an edit to the draft' },
-  '⊘': { color: 'error', means: 'block, request changes, or refuse' },
-  '✎': { means: 'revise the draft before anything is posted' },
-  '⊕': { means: 'add something, such as a follow-up in Linear or a request for a stacked pull request' },
+  '✓': { color: 'success', means: 'approve' },
+  '🗩': { isWide: true, means: 'comment' },
+  '🗈': { isWide: true, means: 'suggested changes' },
+  '⊘': { color: 'error', means: 'request changes' },
 }
 const MAX_GLYPHS = 2
 

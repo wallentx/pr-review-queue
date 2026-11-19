@@ -51,16 +51,14 @@ A failed check shows a red line with the reason, so a failure never reads as an 
 
 ## Choice buttons
 
-After the agent drafts a review, it calls the `offer_choices` tool, which the mod registers, to put buttons after `owner/repo#N`, such as `[✓] [✓🗩 ] [⊘]`. The brackets are light blue. Each button shows one or two glyphs from a fixed palette, and the agent writes what each button does for that review. Clicking a button sends its action to the agent as your own message, starting with its glyph, and removes the buttons. Posting a review also removes them. You can still type an answer instead.
+After the agent drafts a review, it calls the `offer_choices` tool, which the mod registers, to put buttons after `owner/repo#N`, such as `[✓] [✓🗩 ] [⊘]`. The brackets are light blue. Each button shows one or two glyphs from a fixed palette of GitHub review actions, and the agent writes what each button does for that review. Two glyphs combine actions, so `✓🗩` approves with comments. Clicking a button sends its action to the agent as your own message, starting with its glyph, and removes the buttons. Posting a review also removes them. You can still type an answer instead.
 
 | Glyph | Usual meaning |
 | --- | --- |
-| green `✓` | Approve, accept, or go ahead. |
-| `🗩` | Comment or reply. |
-| `🗈` | A note, a suggested change, or an edit to the draft. |
-| red `⊘` | Block, request changes, or refuse. |
-| `✎` | Revise the draft before anything is posted. |
-| `⊕` | Add something, such as a follow-up in Linear or a request for a stacked pull request. |
+| green `✓` | Approve. |
+| `🗩` | Comment. |
+| `🗈` | Post suggested changes. |
+| red `⊘` | Request changes. |
 
 The meanings guide the agent and are not enforced. The mod refuses a glyph outside the palette, or more than two glyphs on one button. Most fonts draw `🗩` and `🗈` two cells wide, so each is followed by a space for it to spill into.
 
