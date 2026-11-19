@@ -40,10 +40,12 @@ While `◨` shows and some pull requests are hidden, a green `⟲` appears besid
 
 | Marker | Meaning |
 | --- | --- |
-| gray `○` | The pull request waits for review. |
-| red `●` | A review of it is running. |
-| green `●` | The review finished, and its results wait to be posted. |
-| (removed) | The review was posted. |
+| gray `○` | The pull request waits for review. Picking it starts one. |
+| yellow `○` | The review command ran, and no subagent has taken the review yet. |
+| pulsing `●` | A subagent is reviewing it. The dot cycles between yellow and blue while the model reads its input or a tool runs, and between yellow and red while the model writes. |
+| green `●` | The review finished, and its draft waits for you. |
+| red `●` | The review ended in an error or a refusal. Picking it starts another. |
+| blue `✓` | The review was posted. The line stays until a complete check no longer lists the pull request, and it no longer counts as waiting. |
 
 A failed check shows a red line with the reason, so a failure never reads as an empty queue.
 
@@ -51,11 +53,15 @@ A failed check shows a red line with the reason, so a failure never reads as an 
 
 `/pr-review-queue:review owner/repo#N` collects the pull request's evidence with `AID.pr`, starts one subagent to review the diff, and shows you a draft review. It posts nothing until you approve the draft, and it then submits the review with `gh pr review`. You can also type the command yourself for a pull request that is not in the queue.
 
-To use your own command, set `reviewCommand` to its name without the slash. The status markers below depend on what that command does, so a replacement needs to start a subagent with `owner/repo#N` in its prompt and post with `gh pr review` for the line to turn green and then disappear.
+To use your own command, set `reviewCommand` to its name without the slash. The status markers below depend on what that command does, so a replacement needs to start a subagent with `owner/repo#N` in its prompt and post with `gh pr review` or a `gh api` POST to the pull request's reviews for the line to pulse, turn green, and then show a check.
 
 ## Status tracking
 
-A line turns red when the review command runs with `owner/repo#N` in its arguments, whether you picked the line or typed the command. It turns green when a subagent whose prompt contains `owner/repo#N` finishes. It disappears when a Bash call of `gh pr review N --repo owner/repo` with `--approve`, `--request-changes`, or `--comment` succeeds. A posted pull request stays hidden until a later check no longer lists it, and a new review request after that shows it gray again.
+A line turns yellow when the review command runs with `owner/repo#N` in its arguments, whether you picked the line or typed the command. The main turn whose prompt names `owner/repo#N` is that review's own turn. When a subagent whose prompt contains `owner/repo#N` starts, the line becomes that subagent's, and its dot pulses until the subagent's turn ends.
+
+How the turn ends sets the dot. An answer turns it green, an error or a refusal turns it red, and ctrl+c turns it gray again so the line can be picked again. When the review's own main turn ends before any subagent started, the same rule applies, so a review the model did in the main conversation turns green. Each queue check and every 2 seconds of pulsing also compare the tracked subagents with the engine's agent list, so a subagent that was killed or vanished without an event still turns its dot gray.
+
+A line turns into a blue check when a Bash call that posts a review succeeds: `gh pr review N --repo owner/repo` with `--approve`, `--request-changes`, or `--comment`, or a `gh api` POST to `repos/owner/repo/pulls/N/reviews`. The line stays listed until a later complete check no longer lists the pull request.
 
 ## Options
 

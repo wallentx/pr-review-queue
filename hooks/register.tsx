@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Queue, QueueItem, ReviewStatus } from '../types'
+import type { Activity, Queue, QueueItem, ReviewStatus } from '../types'
 
 const POLL_MS = 5 * 60 * 1000
 /** How often a session looks at the shared file for a newer result. */
@@ -19,8 +19,20 @@ const isEnabled = atom({ plugin: 'pr-review-queue', key: 'isEnabled' } as const,
 const isExpanded = atom({ plugin: 'pr-review-queue', key: 'isExpanded' } as const, false)
 // Change a tag when its value's fields change, so a stale stored value is dropped.
 const queue = atom({ plugin: 'pr-review-queue', key: 'queue' } as const, null, { shape: 'queue-2' })
-const statuses = atom({ plugin: 'pr-review-queue', key: 'statuses' } as const, {}, { shape: 'statuses-1' })
+const statuses = atom({ plugin: 'pr-review-queue', key: 'statuses' } as const, {}, { shape: 'statuses-2' })
 const agents = atom({ plugin: 'pr-review-queue', key: 'agents' } as const, {}, { shape: 'agents-1' })
+const activity = atom({ plugin: 'pr-review-queue', key: 'activity' } as const, {}, { shape: 'activity-1' })
+const commandTurns = atom({ plugin: 'pr-review-queue', key: 'commandTurns' } as const, {}, { shape: 'turns-1' })
+const frame = atom({ plugin: 'pr-review-queue', key: 'frame' } as const, 0)
+
+/** How often a running review's dot changes color. */
+const PULSE_MS = 250
+/** How many pulse frames pass between checks of the agent list. */
+const RECONCILE_FRAMES = 8
+/** Yellow to blue while the model reads its input or a tool runs: tokens in. */
+const IN_COLORS = ['#e5c07b', '#c9bb93', '#a5b6b3', '#82b2d3', '#61afef', '#82b2d3', '#a5b6b3', '#c9bb93']
+/** Yellow to red while the model writes: tokens out. */
+const OUT_COLORS = ['#e5c07b', '#e4b17a', '#e3a079', '#e18e77', '#e06c75', '#e18e77', '#e3a079', '#e4b17a']
 const hiddenAtom = atom({ plugin: 'pr-review-queue', key: 'hidden' } as const, [], { shape: 'hidden-1' })
 const isEditing = atom({ plugin: 'pr-review-queue', key: 'isEditing' } as const, false)
 const isShowingHidden = atom({ plugin: 'pr-review-queue', key: 'isShowingHidden' } as const, false)
@@ -69,14 +81,29 @@ function refsIn(text: string): string[] {
   return Array.from(text.matchAll(REF_RE), m => `${m[1]}#${m[2]}`)
 }
 
-/** The refs a shell command posted a review to with `gh pr review N --repo owner/repo --approve|...`. */
+const API_REVIEW_RE = /repos\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pulls\/(\d+)\/reviews(?![\/\w])/
+
+/**
+ * The refs a shell command posted a review to: `gh pr review N --repo
+ * owner/repo` with `--approve`, `--request-changes` or `--comment`, or a `gh
+ * api` POST to `repos/owner/repo/pulls/N/reviews`, the way a review with inline
+ * comments is posted. A `gh api` call sends a POST when it names the method or
+ * carries a field or an input file.
+ */
 function postedRefs(command: string): string[] {
   const refs: string[] = []
   for (const part of command.split(/&&|\|\||;|\n/)) {
-    if (!/\bgh\s+pr\s+review\b/.test(part) || !/--(approve|request-changes|comment)\b|\s-[arc]\b/.test(part)) continue
-    const repo = part.match(/(?:--repo|-R)[\s=]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/)?.[1]
-    const number = part.match(/\bgh\s+pr\s+review\s+(?:-\S+\s+\S+\s+)*?(\d+)\b/)?.[1]
-    if (repo && number) refs.push(`${repo}#${number}`)
+    if (/\bgh\s+pr\s+review\b/.test(part) && /--(approve|request-changes|comment)\b|\s-[arc]\b/.test(part)) {
+      const repo = part.match(/(?:--repo|-R)[\s=]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/)?.[1]
+      const number = part.match(/\bgh\s+pr\s+review\s+(?:-\S+\s+\S+\s+)*?(\d+)\b/)?.[1]
+      if (repo && number) refs.push(`${repo}#${number}`)
+      continue
+    }
+    const api = /\bgh\s+api\b/.test(part) ? part.match(API_REVIEW_RE) : null
+    const isPost =
+      /(?:-X|--method)[\s=]+['"]?POST\b/i.test(part) ||
+      (!/(?:-X|--method)[\s=]+['"]?(?:GET|PUT|PATCH|DELETE)\b/i.test(part) && /\s(?:-f|-F|--field|--raw-field|--input)[\s=]/.test(part))
+    if (api && isPost) refs.push(`${api[1]}#${api[2]}`)
   }
   return refs
 }
@@ -86,6 +113,24 @@ function fit(text: string, width: number): string {
   const chars = Array.from(text.replace(/\s+/g, ' ').trim())
   if (width <= 0) return ''
   return chars.length <= width ? chars.join('') : chars.slice(0, Math.max(0, width - 1)).join('') + '…'
+}
+
+/** The dot's color: its status, and for a running review what its subagent is doing. */
+function markerColor(state: ReviewStatus | undefined, doing: Activity | undefined, tick: number): string {
+  switch (state) {
+    case 'starting':
+      return 'warning'
+    case 'running':
+      return (doing === 'out' ? OUT_COLORS : IN_COLORS)[tick % IN_COLORS.length]!
+    case 'done':
+      return 'success'
+    case 'failed':
+      return 'error'
+    case 'posted':
+      return 'suggestion'
+    default:
+      return 'inactive'
+  }
 }
 
 type Config = { aidPath: string; owner: string; workspace: string; reviewCommand: string }
@@ -146,6 +191,7 @@ let timer: { cancel: () => void } | undefined
 let cachePath: string | undefined
 let lastSeen = 0
 let isTicking = false
+let pulse: { cancel: () => void } | undefined
 let unreadableSince: number | undefined
 const holder = Math.random().toString(36).slice(2)
 
@@ -192,6 +238,8 @@ async function setHidden($: EngineInterface, ref: string, isHidden: boolean): Pr
 
 async function tick($: EngineInterface): Promise<void> {
   await loadHidden($)
+  await reconcile($)
+  await syncPulse($)
   // A fetch can outlast TICK_MS, and the claim already names this session, so
   // a second check started meanwhile would fetch again.
   if (isTicking) return
@@ -313,15 +361,70 @@ async function stopPolling($: EngineInterface): Promise<void> {
   await update($, isExpanded, () => false)
 }
 
-async function markRunning($: EngineInterface, refs: readonly string[]): Promise<void> {
+/** Marks PRs whose review command just ran: yellow until a subagent picks them up. */
+async function markStarting($: EngineInterface, refs: readonly string[]): Promise<void> {
   if (refs.length === 0) return
   await update($, statuses, all => {
     const marked: Record<string, ReviewStatus> = { ...all }
-    for (const ref of refs) {
-      if (marked[ref] !== 'posted') marked[ref] = 'running'
-    }
+    for (const ref of refs) marked[ref] = 'starting'
     return marked
   })
+  await update($, commandTurns, all => Object.fromEntries(Object.entries(all).filter(([ref]) => !refs.includes(ref))))
+}
+
+async function setActivity($: EngineInterface, ref: string, doing: Activity): Promise<void> {
+  await update($, activity, (all): Record<string, Activity> => (all[ref] === doing ? all : { ...all, [ref]: doing }))
+}
+
+/** Sets one PR's status, or clears it (gray) with undefined. */
+async function setStatus($: EngineInterface, ref: string, status: ReviewStatus | undefined): Promise<void> {
+  await update($, statuses, all => {
+    const { [ref]: _, ...rest } = all
+    return status === undefined ? rest : { ...rest, [ref]: status }
+  })
+}
+
+/** Ends a reviewer's tracking and sets its PR's status from how the subagent ended. */
+async function endReviewer($: EngineInterface, agentId: string, status: ReviewStatus | undefined): Promise<void> {
+  const ref = (await read($, agents))[agentId]
+  if (ref === undefined) return
+  await update($, agents, all => Object.fromEntries(Object.entries(all).filter(([id]) => id !== agentId)))
+  await update($, activity, all => Object.fromEntries(Object.entries(all).filter(([r]) => r !== ref)))
+  if ((await read($, statuses))[ref] === 'running') await setStatus($, ref, status)
+}
+
+/**
+ * Settles reviewers whose end no event reported, from the engine's agent list:
+ * a finished one turns green, a failed one red, and a stopped or vanished one
+ * gray, so it can be picked again.
+ */
+async function reconcile($: EngineInterface): Promise<void> {
+  const tracked = Object.keys(await read($, agents))
+  if (tracked.length === 0) return
+  const list = await $.agent.list().catch(() => undefined)
+  if (list === undefined) return
+  for (const id of tracked) {
+    const info = list.find(agent => agent.id === id)
+    if (info === undefined || info.status === 'killed') await endReviewer($, id, undefined)
+    else if (info.status === 'completed') await endReviewer($, id, 'done')
+    else if (info.status === 'failed') await endReviewer($, id, 'failed')
+  }
+}
+
+/** Runs the pulse while any review is running, and stops it when none is. */
+async function syncPulse($: EngineInterface): Promise<void> {
+  const isRunning = Object.values(await read($, statuses)).includes('running')
+  if (isRunning && pulse === undefined) {
+    let count = 0
+    pulse = $.clock.every(PULSE_MS, () => {
+      count++
+      void update($, frame, n => (n + 1) % IN_COLORS.length)
+      if (count % RECONCILE_FRAMES === 0) void reconcile($).then(() => syncPulse($))
+    })
+  } else if (!isRunning && pulse !== undefined) {
+    pulse.cancel()
+    pulse = undefined
+  }
 }
 
 export const register: Register = (on, options) => {
@@ -368,53 +471,96 @@ export const register: Register = (on, options) => {
     return { text: 'The PR review queue is off.' }
   })
 
-  // A review started from the queue or typed by hand marks its PRs red.
+  // A review started from the queue or typed by hand marks its PRs yellow.
   on('command.run', async ($, e, next) => {
-    if (e.command === config.reviewCommand) await markRunning($, refsIn(e.args))
+    if (e.command === config.reviewCommand) await markStarting($, refsIn(e.args))
     return next(e)
   })
 
-  // A subagent whose prompt names a running PR is that PR's reviewer.
-  on('agent.spawn', async ($, e, next) => {
+  // The main turn that runs the review command names its PR in its prompt.
+  on('turn.start', async ($, e, next) => {
     const started = await next(e)
-    if (!started.agentId) return started
-    const running = Object.entries(await read($, statuses))
-      .filter(([, status]) => status === 'running')
+    if (e.agentId !== undefined) return started
+    const starting = Object.entries(await read($, statuses))
+      .filter(([, status]) => status === 'starting')
       .map(([ref]) => ref)
-    const named = new Set(refsIn(e.prompt))
-    const ref = running.find(r => named.has(r))
-    if (ref) {
-      const id = started.agentId
-      await update($, agents, all => ({ ...all, [id]: ref }))
+    const named = new Set(refsIn(e.text))
+    const bound = new Set(Object.keys(await read($, commandTurns)))
+    const refs = starting.filter(ref => named.has(ref) && !bound.has(ref))
+    if (refs.length > 0) {
+      await update($, commandTurns, all => ({ ...all, ...Object.fromEntries(refs.map(ref => [ref, e.turnId])) }))
     }
     return started
   })
 
-  // The reviewer's last turn turns its PR green: finished, not yet posted.
+  // A subagent whose prompt names a starting PR is that PR's reviewer.
+  on('agent.spawn', async ($, e, next) => {
+    const started = await next(e)
+    if (!started.agentId) return started
+    const status = await read($, statuses)
+    const named = new Set(refsIn(e.prompt))
+    const ref = Object.keys(status).find(r => named.has(r) && status[r] === 'starting')
+    if (ref) {
+      const id = started.agentId
+      await update($, agents, all => ({ ...all, [id]: ref }))
+      await setActivity($, ref, 'in')
+      await setStatus($, ref, 'running')
+      await syncPulse($)
+    }
+    return started
+  })
+
+  // A reviewer's step: the model reads its input until the first piece arrives, then writes.
+  on('turn.step', async function* ($, e, next) {
+    const ref = e.agentId === undefined ? undefined : (await read($, agents))[e.agentId]
+    if (ref === undefined) return yield* next(e)
+    await setActivity($, ref, 'in')
+    let isWriting = false
+    const stream = next(e)
+    for await (const chunk of stream) {
+      if (!isWriting && chunk.kind !== 'engine') {
+        isWriting = true
+        await setActivity($, ref, 'out')
+      }
+      yield chunk
+    }
+    return await stream.result
+  })
+
+  // How a turn ended settles the PR it was reviewing.
   on('turn.complete', async ($, e, next) => {
     const id = e.agentId
+    const status = e.reason === 'answer' ? 'done' : e.reason === 'aborted' ? undefined : 'failed'
     if (id !== undefined) {
-      const ref = (await read($, agents))[id]
-      if (ref !== undefined) {
-        await update($, statuses, (all): Record<string, ReviewStatus> => (all[ref] === 'running' ? { ...all, [ref]: 'done' } : all))
-        await update($, agents, all => Object.fromEntries(Object.entries(all).filter(([k]) => k !== id)))
+      await endReviewer($, id, status)
+    } else {
+      // The command's own turn ended before any subagent took the review: it was
+      // stopped, it failed, or the model reviewed in the main conversation.
+      const turns = await read($, commandTurns)
+      const refs = Object.keys(turns).filter(ref => turns[ref] === e.turnId)
+      for (const ref of refs) {
+        if ((await read($, statuses))[ref] === 'starting') await setStatus($, ref, status)
+      }
+      if (refs.length > 0) {
+        await update($, commandTurns, all => Object.fromEntries(Object.entries(all).filter(([ref]) => !refs.includes(ref))))
       }
     }
+    await syncPulse($)
     return next(e)
   })
 
-  // A successful `gh pr review` removes the PR from the queue right away.
+  // A reviewer running a tool waits on input, so its dot pulses blue.
+  on('tool.call', async ($, e, next) => {
+    const ref = e.agentId === undefined ? undefined : (await read($, agents))[e.agentId]
+    if (ref !== undefined) await setActivity($, ref, 'in')
+    return next(e)
+  })
+
+  // A successful `gh pr review` marks the PR posted; it stays listed until the queue drops it.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
     if (ran.isError || ran.deny !== undefined) return ran
-    const refs = postedRefs(e.command)
-    if (refs.length > 0) {
-      await update($, statuses, all => {
-        const marked: Record<string, ReviewStatus> = { ...all }
-        for (const ref of refs) marked[ref] = 'posted'
-        return marked
-      })
-    }
+    for (const ref of postedRefs(e.command)) await setStatus($, ref, 'posted')
     return ran
   })
 
@@ -439,10 +585,13 @@ export const register: Register = (on, options) => {
 
     const status = await read($, statuses)
     const hiddenRefs = new Set(await read($, hiddenAtom))
-    const listed = q.items.filter(item => status[refOf(item)] !== 'posted')
-    const visible = listed.filter(item => !hiddenRefs.has(refOf(item)))
-    const hiddenItems = listed.filter(item => hiddenRefs.has(refOf(item)))
-    const total = Math.max(0, q.total - (q.items.length - visible.length))
+    const visible = q.items.filter(item => !hiddenRefs.has(refOf(item)))
+    const hiddenItems = q.items.filter(item => hiddenRefs.has(refOf(item)))
+    // A posted review stays on its line with a check mark but no longer counts as waiting.
+    const posted = visible.filter(item => status[refOf(item)] === 'posted').length
+    const total = Math.max(0, q.total - hiddenItems.length - posted)
+    const tick = await read($, frame)
+    const doing = await read($, activity)
     // A queue whose every pull request is hidden still draws its line, so the
     // hidden ones can be brought back.
     if (total === 0 && hiddenItems.length === 0) {
@@ -530,8 +679,8 @@ export const register: Register = (on, options) => {
       const strike = isHidden ? { strikethrough: true, dimColor: true } : {}
       // An array, since a Button holds strings and Text only, never a fragment's Box.
       return [
-        <Text key="marker" {...strike} color={state === 'running' ? 'error' : state === 'done' ? 'success' : 'inactive'}>
-          {state === undefined ? '○' : '●'}
+        <Text key="marker" {...strike} color={markerColor(state, doing[ref], tick)}>
+          {state === undefined || state === 'starting' ? '○' : state === 'posted' ? '✓' : '●'}
         </Text>,
         <Text key="gap" {...strike}> </Text>,
         <Text key="org" {...strike} color="suggestion">{org}</Text>,
@@ -561,8 +710,9 @@ export const register: Register = (on, options) => {
                 plain
                 hover={NO_HOVER}
                 onPress={async () => {
-                  if (state !== undefined) return
-                  await markRunning($, [ref])
+                  // Only a waiting or failed review starts again.
+                  if (state !== undefined && state !== 'failed') return
+                  await markStarting($, [ref])
                   // The command queues a model turn that outlasts the press budget, so it is not awaited.
                   void $.command.run({ command: config.reviewCommand, args: ref }).catch(err =>
                     $.ui.toast(`Could not start the review of ${ref}: ${err instanceof Error ? err.message.slice(0, 80) : 'unknown error'}`),

@@ -84,7 +84,13 @@ const settle = async () => {
 const A = 'pr-FarmGPU/fgpu_ansible#207'
 const B = 'pr-FarmGPU/onepass-client#31'
 
-test('a review goes gray, red, green, then leaves the queue once posted', async ($, on) => {
+/** Sets up a session with the queue on and the review command, a subagent and a turn's end answered. */
+async function reviewSession(
+  $: Parameters<Body>[0],
+  on: On,
+  // A queue check reads the agent list, which holds a spawned reviewer until it ends.
+  agentList: { id: string; status: string }[] = [{ id: 'agent-1', status: 'running' }],
+) {
   const started: string[] = []
   on('command.register', () => ({ value: { command: 'pr-queue' } }))
   sharedCache(on)
@@ -93,11 +99,13 @@ test('a review goes gray, red, green, then leaves the queue once posted', async 
   }))
   on('clock.every', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
+  on('agent.list', () => ({ value: agentList as never }))
   on('command.run', { command: 'pr-review-queue:review' }, (_, e) => {
     started.push(e.args)
     return { text: '' }
   })
   on('agent.spawn', () => ({ model: 'sonnet', agentId: 'agent-1' }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   on('tool.call', () => ({ result: {} }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -105,32 +113,111 @@ test('a review goes gray, red, green, then leaves the queue once posted', async 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await queueSwitch($, 'on')
   await settle()
-
   const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /Reviews waiting: 2/ }))?.text).toBeTruthy()
-
   await ui.press({ key: 'toggle' })
-  const row = await ui.find({ type: 'Button', key: A })
-  expect(row).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: '○' })).toBeTruthy()
-  expect(await ui.find({ type: 'Text', text: '●' })).toBeFalsy()
+  return { ui, started }
+}
 
-  // A press starts the command and turns the row red.
+// The test fills only the fields the mod reads; the engine fills the rest in a session.
+const spawn = ($: Parameters<Body>[0]) =>
+  $.agent.spawn({ prompt: 'Review PR: FarmGPU/fgpu_ansible#207 read-only.' } as Parameters<typeof $.agent.spawn>[0])
+const turnStart = ($: Parameters<Body>[0], turnId: string, text: string) =>
+  $.turn.start({ turnId, text } as Parameters<typeof $.turn.start>[0])
+const turnEnd = ($: Parameters<Body>[0], reason: string, ids: { turnId: string; agentId?: string }) =>
+  $.turn.complete({ reason, durationMs: 1, ...ids } as Parameters<typeof $.turn.complete>[0])
+
+/** The color and glyph of the first row's dot. */
+async function dotOf(ui: { drawn: () => Promise<unknown> }): Promise<{ glyph: string; color: string }> {
+  await settle()
+  const root = (await ui.drawn()) as any
+  const row = root.children[1]
+  const button = row.children.find((c: any) => c.type === 'Button')
+  const marker = button.children[0]
+  return { glyph: marker.children.join(''), color: marker.props?.color }
+}
+
+test('a review goes gray, yellow, pulsing, green, then posted with a check that stays listed', async ($, on) => {
+  const { ui, started } = await reviewSession($, on)
+  expect(await dotOf(ui)).toEqual({ glyph: '○', color: 'inactive' })
+
+  // A press runs the command and turns the dot yellow until a subagent takes the review.
   await ui.press({ key: A })
   expect(started).toEqual(['FarmGPU/fgpu_ansible#207'])
-  expect((await ui.find({ type: 'Text', text: '●' }))?.props?.color).toBe('error')
+  expect(await dotOf(ui)).toEqual({ glyph: '○', color: 'warning' })
 
-  // The reviewer subagent finishing turns it green.
-  // The test fills only the fields the mod reads; the engine fills the rest in a session.
-  await $.agent.spawn({ prompt: 'Review PR: FarmGPU/fgpu_ansible#207 read-only.' } as Parameters<typeof $.agent.spawn>[0])
-  await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', agentId: 'agent-1' } as Parameters<typeof $.turn.complete>[0])
-  expect((await ui.find({ type: 'Text', text: '●' }))?.props?.color).toBe('success')
+  // The subagent that names the PR makes the dot a pulsing filled circle.
+  await spawn($)
+  const running = await dotOf(ui)
+  expect(running.glyph).toBe('●')
+  expect(running.color).toMatch(/^#[0-9a-f]{6}$/)
 
-  // Posting the review removes the row; the other PR stays.
+  // Its turn ending with an answer turns the dot green.
+  await turnEnd($, 'answer', { turnId: 't1', agentId: 'agent-1' })
+  expect(await dotOf(ui)).toEqual({ glyph: '●', color: 'success' })
+
+  // Posting the review keeps the row, marks it with a check, and drops it from the count.
   await $.tool.call({ tool: 'Bash', command: 'gh pr review 207 --repo FarmGPU/fgpu_ansible --approve --body-file /tmp/x.md' })
-  expect(await ui.find({ type: 'Button', key: A })).toBeFalsy()
-  expect(await ui.find({ type: 'Button', key: B })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: A })).toBeTruthy()
+  expect(await dotOf(ui)).toEqual({ glyph: '✓', color: 'suggestion' })
   expect((await ui.find({ type: 'Text', text: /Reviews waiting: 1/ }))?.text).toBeTruthy()
+  await ui.unmount()
+})
+
+test('stopping the reviewer turns the dot gray, and the row can be picked again', async ($, on) => {
+  const { ui, started } = await reviewSession($, on)
+  await ui.press({ key: A })
+  await spawn($)
+  await turnEnd($, 'aborted', { turnId: 't1', agentId: 'agent-1' })
+  expect(await dotOf(ui)).toEqual({ glyph: '○', color: 'inactive' })
+  await ui.press({ key: A })
+  expect(started).toHaveLength(2)
+  await ui.unmount()
+})
+
+test('stopping the command before a subagent starts turns the dot gray', async ($, on) => {
+  const { ui } = await reviewSession($, on)
+  await ui.press({ key: A })
+  // Another main turn ending does not settle it; only the turn that names the PR does.
+  await turnEnd($, 'aborted', { turnId: 'other' })
+  expect(await dotOf(ui)).toEqual({ glyph: '○', color: 'warning' })
+  await turnStart($, 'm1', 'Review pull request FarmGPU/fgpu_ansible#207.')
+  await turnEnd($, 'aborted', { turnId: 'm1' })
+  expect(await dotOf(ui)).toEqual({ glyph: '○', color: 'inactive' })
+  await ui.unmount()
+})
+
+test('a review the main conversation finished without a subagent turns green', async ($, on) => {
+  const { ui } = await reviewSession($, on)
+  await ui.press({ key: A })
+  await turnStart($, 'm1', 'Review pull request FarmGPU/fgpu_ansible#207.')
+  await turnEnd($, 'answer', { turnId: 'm1' })
+  expect(await dotOf(ui)).toEqual({ glyph: '●', color: 'success' })
+  await ui.unmount()
+})
+
+test('a failed reviewer turns the dot red, and the row can be picked again', async ($, on) => {
+  const { ui, started } = await reviewSession($, on)
+  await ui.press({ key: A })
+  await spawn($)
+  await turnEnd($, 'error', { turnId: 't1', agentId: 'agent-1' })
+  expect(await dotOf(ui)).toEqual({ glyph: '●', color: 'error' })
+  await ui.press({ key: A })
+  expect(started).toHaveLength(2)
+  await ui.unmount()
+})
+
+test('a reviewer the agent list shows as killed turns the dot gray on the next check', async ($, on) => {
+  const agentList = [{ id: 'agent-1', status: 'running' }]
+  const { ui } = await reviewSession($, on, agentList)
+  await ui.press({ key: A })
+  await spawn($)
+  expect((await dotOf(ui)).glyph).toBe('●')
+  agentList[0]!.status = 'killed'
+  await queueSwitch($, 'off')
+  await queueSwitch($, 'on')
+  await settle()
+  await ui.press({ key: 'toggle' })
+  expect(await dotOf(ui)).toEqual({ glyph: '○', color: 'inactive' })
   await ui.unmount()
 })
 
@@ -442,4 +529,18 @@ test('unhide with a pull request shows only that one again', async ($, on) => {
   const answer = (await queueSwitch($, 'unhide FarmGPU/onepass-client#31')) as { text: string }
   expect(answer.text).toBe('1 hidden pull request is shown again.')
   expect(store.get('hiddenRefs')).toEqual(['FarmGPU/fgpu_ansible#207'])
+})
+
+test('a gh api POST to a pull request reviews endpoint counts as a posted review', async ($, on) => {
+  const { ui } = await reviewSession($, on)
+  // Reading reviews, or replying under a review's comments, posts nothing.
+  await $.tool.call({ tool: 'Bash', command: 'gh api repos/FarmGPU/fgpu_ansible/pulls/207/reviews --jq .[].state' })
+  await $.tool.call({ tool: 'Bash', command: 'gh api -X POST repos/FarmGPU/fgpu_ansible/pulls/207/reviews/9/events -f event=APPROVE' })
+  expect((await dotOf(ui)).glyph).toBe('○')
+  await $.tool.call({
+    tool: 'Bash',
+    command: 'head=$(gh pr view 207 --json headRefOid -q .headRefOid) && gh api -X POST repos/FarmGPU/fgpu_ansible/pulls/207/reviews --input /tmp/review.json',
+  })
+  expect(await dotOf(ui)).toEqual({ glyph: '✓', color: 'suggestion' })
+  await ui.unmount()
 })
