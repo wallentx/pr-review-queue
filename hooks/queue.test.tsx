@@ -356,7 +356,7 @@ test('the square edits the list: the cross hides a row, the circle arrow lists h
 
   // The square expands the list and puts a cross on every row.
   await ui.press({ key: 'edit' })
-  expect(await ui.find({ type: 'Text', text: '□' })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: '◨' })).toBeTruthy()
   expect(await ui.find({ type: 'Text', text: '▼' })).toBeTruthy()
   expect(await ui.find({ type: 'Button', key: HIDE_A })).toBeTruthy()
   expect(await ui.find({ type: 'Button', key: HIDE_B })).toBeTruthy()
@@ -377,7 +377,7 @@ test('the square edits the list: the cross hides a row, the circle arrow lists h
 
   // A plain space follows each control glyph.
   const lines = await linesOf(ui)
-  expect(lines[0]).toStartWith('□ ⟲ Reviews waiting: 1')
+  expect(lines[0]).toStartWith('◨ ⟲ Reviews waiting: 1')
   expect(lines[1]).toStartWith('⨯ ○ ')
 
   // The header's arrow lists hidden rows struck through, each with its own green arrow.

@@ -470,7 +470,7 @@ export const register: Register = (on, options) => {
             await update($, isExpanded, () => true)
           }}
         >
-          <Text>{editing ? '□' : '◧'}</Text>
+          <Text>{editing ? '◨' : '◧'}</Text>
         </Button>
         <Text key="edit-gap"> </Text>
         {editing && hiddenItems.length > 0 ? (
