@@ -36,7 +36,7 @@ When pull requests are waiting, a row reads `◧ Reviews waiting: N` followed by
 
 Clicking `◧` opens the list if it is closed, turns it into `◨`, and moves every line to the right to show a red `⨯` at its start. Clicking `◨` again removes the `⨯` marks. Clicking a `⨯` hides that pull request from the list and from the count in every session. Other open sessions pick up the change within 30 seconds.
 
-While `◨` shows and some pull requests are hidden, a green `⟲` appears beside it. Clicking that `⟲` lists the hidden pull requests struck through, each with its own green `⟲` at its start, and clicking a row's `⟲` restores that pull request to the list. A hidden pull request that stops waiting for your review, because you posted one or it was merged or closed, is forgotten after the next complete check. `/pr-queue unhide owner/repo#N` restores one pull request from the prompt, and `/pr-queue unhide` restores them all.
+While `◨` shows and some pull requests are hidden, a green `⟲` appears beside it. Clicking that `⟲` lists the hidden pull requests struck through, each with its own green `⟲` at its start, and clicking a row's `⟲` restores that pull request to the list. A hidden pull request that stops waiting for your review, because you posted one or it was merged or closed, is forgotten after the next complete check of the query that hid it. Sessions with a different owner, workspace, or GitHub account run a different query, so their checks leave it hidden. While the hidden pull requests are listed, they get room first, and the waiting ones fill the rest of the 9 lines. `/pr-queue unhide owner/repo#N` restores one pull request from the prompt, and `/pr-queue unhide` restores them all.
 
 | Marker | Meaning |
 | --- | --- |

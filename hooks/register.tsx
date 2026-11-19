@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Activity, Choice, Queue, QueueItem, ReviewStatus } from '../types'
+import type { Activity, Choice, HiddenEntry, Queue, QueueItem, ReviewStatus } from '../types'
 
 const POLL_MS = 5 * 60 * 1000
 /** How often a session looks at the shared file for a newer result. */
@@ -33,7 +33,7 @@ const RECONCILE_FRAMES = 8
 const IN_COLORS = ['#e5c07b', '#c9bb93', '#a5b6b3', '#82b2d3', '#61afef', '#82b2d3', '#a5b6b3', '#c9bb93']
 /** Yellow to red while the model writes: tokens out. */
 const OUT_COLORS = ['#e5c07b', '#e4b17a', '#e3a079', '#e18e77', '#e06c75', '#e18e77', '#e3a079', '#e4b17a']
-const hiddenAtom = atom({ plugin: 'pr-review-queue', key: 'hidden' } as const, [], { shape: 'hidden-1' })
+const hiddenAtom = atom({ plugin: 'pr-review-queue', key: 'hidden' } as const, [], { shape: 'hidden-2' })
 const isEditing = atom({ plugin: 'pr-review-queue', key: 'isEditing' } as const, false)
 const isShowingHidden = atom({ plugin: 'pr-review-queue', key: 'isShowingHidden' } as const, false)
 const HIDDEN_KEY = 'hiddenRefs'
@@ -210,17 +210,20 @@ function hashOf(text: string): string {
  * account and host are part of it too, so sessions signed in differently never
  * share a result. They reach the file name only through the hash.
  */
-async function cachePathOf($: EngineInterface, cwd: string): Promise<string | undefined> {
-  const base = (await $.env.get('XDG_CACHE_HOME')) || ((h => (h ? `${h}/.cache` : undefined))(await $.env.get('HOME')))
-  if (!base) return undefined
+async function queryKeyOf($: EngineInterface, cwd: string): Promise<string> {
   const identity = [
     await $.env.get('GH_TOKEN'),
     await $.env.get('GITHUB_TOKEN'),
     await $.env.get('GH_HOST'),
     await $.env.get('GH_CONFIG_DIR'),
   ]
-  const query = JSON.stringify([queueArgv(config), config.workspace || cwd, identity])
-  return `${base}/pr-review-queue/queue-${hashOf(query)}.json`
+  return hashOf(JSON.stringify([queueArgv(config), config.workspace || cwd, identity]))
+}
+
+/** The shared result's file for a query, or undefined when neither XDG_CACHE_HOME nor HOME is set. */
+async function cachePathOf($: EngineInterface, key: string): Promise<string | undefined> {
+  const base = (await $.env.get('XDG_CACHE_HOME')) || ((h => (h ? `${h}/.cache` : undefined))(await $.env.get('HOME')))
+  return base ? `${base}/pr-review-queue/queue-${key}.json` : undefined
 }
 
 /** What sessions with the same query share: the last result and who is fetching the next one. */
@@ -229,6 +232,8 @@ type Shared = { fetchedAt?: number; result?: Queue; claimedBy?: string; claimedA
 let config: Config = configOf(undefined)
 let timer: { cancel: () => void } | undefined
 let cachePath: string | undefined
+/** This session's query, by the hash its cache file is named with. */
+let queryKey = ''
 let lastSeen = 0
 let isTicking = false
 let pulse: { cancel: () => void } | undefined
@@ -254,26 +259,46 @@ async function readShared($: EngineInterface, path: string): Promise<Shared | un
  * that claim at the same moment can both fetch once, which costs one extra
  * AID.review-queue run and nothing else.
  */
+/**
+ * The hidden list as stored. An entry from before queries were recorded is a
+ * bare ref, read with an empty query so any session's complete check may
+ * forget it, as every session could before.
+ */
+function entriesOf(stored: unknown): HiddenEntry[] {
+  if (!Array.isArray(stored)) return []
+  return stored.flatMap((entry: any): HiddenEntry[] =>
+    typeof entry === 'string'
+      ? [{ ref: entry, query: '' }]
+      : typeof entry?.ref === 'string' && typeof entry?.query === 'string'
+        ? [{ ref: entry.ref, query: entry.query }]
+        : [],
+  )
+}
+
 /** Reads the hidden pull requests from the store, which every session shares. */
 async function loadHidden($: EngineInterface): Promise<void> {
   // A store that cannot be read keeps the list this session already has.
   const stored = await $.store.get(HIDDEN_KEY).catch(() => undefined)
   if (stored === undefined) return
-  const refs = Array.isArray(stored) ? stored.filter((r): r is string => typeof r === 'string') : []
-  await update($, hiddenAtom, all => (all.length === refs.length && all.every((r, i) => r === refs[i]) ? all : refs))
+  const entries = entriesOf(stored)
+  await update($, hiddenAtom, all => (JSON.stringify(all) === JSON.stringify(entries) ? all : entries))
 }
 
-async function saveHidden($: EngineInterface, refs: string[]): Promise<void> {
-  await $.store.set(HIDDEN_KEY, refs)
-  await update($, hiddenAtom, () => refs)
+async function saveHidden($: EngineInterface, entries: HiddenEntry[]): Promise<void> {
+  await $.store.set(HIDDEN_KEY, entries)
+  await update($, hiddenAtom, () => entries)
 }
 
-/** Hides or restores one pull request in every session. */
+/**
+ * Hides or restores one pull request in every session. Hiding records this
+ * session's query beside the ref, so only a check of that query forgets it.
+ * Restoring drops the ref for every query.
+ */
 async function setHidden($: EngineInterface, ref: string, isHidden: boolean): Promise<void> {
-  const stored = await $.store.get(HIDDEN_KEY)
-  const before = Array.isArray(stored) ? stored.filter((r): r is string => typeof r === 'string') : []
-  const rest = before.filter(r => r !== ref)
-  await saveHidden($, isHidden ? [...rest, ref] : rest)
+  const before = entriesOf(await $.store.get(HIDDEN_KEY))
+  if (!isHidden) return saveHidden($, before.filter(entry => entry.ref !== ref))
+  const rest = before.filter(entry => entry.ref !== ref || entry.query !== queryKey)
+  await saveHidden($, [...rest, { ref, query: queryKey }])
 }
 
 async function tick($: EngineInterface): Promise<void> {
@@ -384,10 +409,13 @@ async function apply($: EngineInterface, result: Queue): Promise<void> {
         : Object.fromEntries(Object.entries(all).filter(([ref]) => listed.has(ref))),
     )
     // A hidden pull request that no longer waits on a review (reviewed, merged,
-    // closed) is forgotten. Only a complete list proves it is gone.
+    // closed) is forgotten. Only a complete list proves it is gone, and only
+    // for the query that ran: another session's query lists other pull requests.
     if (result.isComplete) {
-      const kept = (await read($, hiddenAtom)).filter(ref => listed.has(ref))
-      if (kept.length !== (await read($, hiddenAtom)).length) await saveHidden($, kept)
+      const stored = await $.store.get(HIDDEN_KEY).catch(() => undefined)
+      const before = stored === undefined ? await read($, hiddenAtom) : entriesOf(stored)
+      const kept = before.filter(entry => (entry.query !== queryKey && entry.query !== '') || listed.has(entry.ref))
+      if (kept.length !== before.length) await saveHidden($, kept)
     }
   }
 }
@@ -513,7 +541,8 @@ export const register: Register = (on, options) => {
       },
       isDeferred: false,
     })
-    cachePath = await cachePathOf($, started.cwd)
+    queryKey = await queryKeyOf($, started.cwd)
+    cachePath = await cachePathOf($, queryKey)
     // Each session starts off. A hot reload runs this again with the session's
     // state kept, so a queue that was on keeps checking.
     if (await read($, isEnabled)) startPolling($)
@@ -523,13 +552,13 @@ export const register: Register = (on, options) => {
   on('command.run', { command: COMMAND }, async ($, e) => {
     const arg = e.args.trim().toLowerCase()
     if (arg === 'unhide' || arg.startsWith('unhide ')) {
-      const stored = await $.store.get(HIDDEN_KEY)
-      const before = Array.isArray(stored) ? stored.filter((r): r is string => typeof r === 'string') : []
+      const before = entriesOf(await $.store.get(HIDDEN_KEY))
       // `unhide owner/repo#N` shows one pull request again; `unhide` alone shows them all.
       const named = new Set(refsIn(e.args).map(r => r.toLowerCase()))
-      const after = named.size > 0 ? before.filter(r => !named.has(r.toLowerCase())) : []
+      const after = named.size > 0 ? before.filter(entry => !named.has(entry.ref.toLowerCase())) : []
       await saveHidden($, after)
-      const count = before.length - after.length
+      // Two queries can hide the same pull request, so pull requests are counted, not entries.
+      const count = new Set(before.map(entry => entry.ref)).size - new Set(after.map(entry => entry.ref)).size
       return {
         text:
           count === 0
@@ -691,7 +720,7 @@ export const register: Register = (on, options) => {
     }
 
     const status = await read($, statuses)
-    const hiddenRefs = new Set(await read($, hiddenAtom))
+    const hiddenRefs = new Set((await read($, hiddenAtom)).map(entry => entry.ref))
     const visible = q.items.filter(item => !hiddenRefs.has(refOf(item)))
     const hiddenItems = q.items.filter(item => hiddenRefs.has(refOf(item)))
     // A posted review stays on its line with a check mark but no longer counts as waiting.
@@ -700,8 +729,9 @@ export const register: Register = (on, options) => {
     const tick = await read($, frame)
     const doing = await read($, activity)
     // A queue whose every pull request is hidden still draws its line, so the
-    // hidden ones can be brought back.
-    if (total === 0 && hiddenItems.length === 0) {
+    // hidden ones can be brought back, and so does one whose every pull request
+    // was posted, so the checks stay until a later check drops them.
+    if (total === 0 && visible.length === 0 && hiddenItems.length === 0) {
       return next(e)
     }
 
@@ -770,8 +800,10 @@ export const register: Register = (on, options) => {
     }
 
     const columns = e.props.bodyColumns > 0 ? e.props.bodyColumns : 80
-    const rows = visible.slice(0, MAX_ROWS)
-    const hiddenRows = showingHidden ? hiddenItems.slice(0, Math.max(0, MAX_ROWS - rows.length)) : []
+    // Hidden rows get the room first while they are shown, since the person
+    // asked to see them to restore one; the waiting rows take what is left.
+    const hiddenRows = showingHidden ? hiddenItems.slice(0, MAX_ROWS) : []
+    const rows = visible.slice(0, MAX_ROWS - hiddenRows.length)
     const notShown = visible.length - rows.length + (showingHidden ? hiddenItems.length - hiddenRows.length : 0)
 
     const offered = await read($, choicesAtom)

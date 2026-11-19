@@ -462,7 +462,7 @@ test('the square edits the list: the cross hides a row, the circle arrow lists h
   await ui.press({ key: HIDE_A })
   expect(await ui.find({ type: 'Button', key: A })).toBeFalsy()
   expect((await ui.find({ type: 'Text', text: /Reviews waiting: 1/ }))?.text).toBeTruthy()
-  expect(store.get('hiddenRefs')).toEqual(['FarmGPU/fgpu_ansible#207'])
+  expect((store.get('hiddenRefs') as { ref: string }[]).map(entry => entry.ref)).toEqual(['FarmGPU/fgpu_ansible#207'])
 
   // A plain space follows each control glyph.
   const lines = await linesOf(ui)
@@ -490,6 +490,7 @@ test('the square edits the list: the cross hides a row, the circle arrow lists h
 })
 
 test('a hidden pull request that stops waiting for review is forgotten', async ($, on) => {
+  // Bare refs were stored before queries were recorded, so any session's complete check may forget them.
   const store = new Map<string, unknown>([['hiddenRefs', ['FarmGPU/fgpu_ansible#207', 'acme/gone#9']]])
   on('command.register', () => ({ value: { command: 'pr-queue' } }))
   on('clock.every', () => ({ value: undefined }))
@@ -500,7 +501,7 @@ test('a hidden pull request that stops waiting for review is forgotten', async (
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await queueSwitch($, 'on')
   await settle()
-  expect(store.get('hiddenRefs')).toEqual(['FarmGPU/fgpu_ansible#207'])
+  expect((store.get('hiddenRefs') as { ref: string }[]).map(entry => entry.ref)).toEqual(['FarmGPU/fgpu_ansible#207'])
 })
 
 test('a queue whose every pull request is hidden still draws its line', async ($, on) => {
@@ -530,7 +531,7 @@ test('unhide with a pull request shows only that one again', async ($, on) => {
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const answer = (await queueSwitch($, 'unhide FarmGPU/onepass-client#31')) as { text: string }
   expect(answer.text).toBe('1 hidden pull request is shown again.')
-  expect(store.get('hiddenRefs')).toEqual(['FarmGPU/fgpu_ansible#207'])
+  expect((store.get('hiddenRefs') as { ref: string }[]).map(entry => entry.ref)).toEqual(['FarmGPU/fgpu_ansible#207'])
 })
 
 test('a gh api POST to a pull request reviews endpoint counts as a posted review', async ($, on) => {
@@ -599,5 +600,53 @@ test('an offer with a glyph outside the palette is refused, and one for a pull r
   expect(JSON.stringify(await offer($, 'FarmGPU/fgpu_ansible#207', [{ glyph: '👍', action: 'Approve.' }]))).toContain('deny')
   expect(JSON.stringify(await offer($, 'FarmGPU/fgpu_ansible#207', [{ glyph: '✓🗩🗈', action: 'All.' }]))).toContain('deny')
   expect(JSON.stringify(await offer($, 'FarmGPU/other#1', [APPROVE]))).toContain('is not showing FarmGPU/other#1')
+  await ui.unmount()
+})
+
+test("a complete check forgets only hidden pull requests its own query hid", async ($, on) => {
+  // Another session's query lists other pull requests, so its absence here proves nothing.
+  const store = new Map<string, unknown>([['hiddenRefs', [{ ref: 'acme/elsewhere#4', query: 'another-query' }, 'acme/gone#9']]])
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  on('clock.every', () => ({ value: undefined }))
+  sharedCache(on, new Map(), { now: 1_000_000 }, true, {}, store)
+  on('process.run', () => ({ value: { exitCode: 0, stdout: QUEUE, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await queueSwitch($, 'on')
+  await settle()
+  expect(store.get('hiddenRefs')).toEqual([{ ref: 'acme/elsewhere#4', query: 'another-query' }])
+})
+
+test('the list stays drawn after every listed pull request was posted', async ($, on) => {
+  const { ui } = await reviewSession($, on)
+  await $.tool.call({ tool: 'Bash', command: 'gh pr review 207 --repo FarmGPU/fgpu_ansible --approve' })
+  await $.tool.call({ tool: 'Bash', command: 'gh pr review 31 --repo FarmGPU/onepass-client --comment -b ok' })
+  await settle()
+  const lines = await linesOf(ui)
+  expect(lines[0]).toContain('Reviews waiting: 0')
+  expect(lines.slice(1).map(line => line.slice(0, 2))).toEqual(['✓ ', '✓ '])
+  await ui.unmount()
+})
+
+test('hidden rows get room when nine or more pull requests are waiting', async ($, on) => {
+  const items = Array.from({ length: 10 }, (_, i) => ({ repo: 'acme/app', number: i + 1, title: `Change ${i + 1}`, kind: 'new' }))
+  const many = JSON.stringify({ summary: { total: 10, new: 10, re_review: 0 }, sources: { search: { status: 'ok' } }, complete: true, items })
+  const store = new Map<string, unknown>([['hiddenRefs', ['acme/app#10']]])
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  on('clock.every', () => ({ value: undefined }))
+  sharedCache(on, new Map(), { now: 1_000_000 }, true, {}, store)
+  on('process.run', () => ({ value: { exitCode: 0, stdout: many, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await queueSwitch($, 'on')
+  await settle()
+  const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
+  await ui.press({ key: 'edit' })
+  await ui.press({ key: 'show-hidden' })
+  await ui.press({ key: 'restore-acme/app#10' })
+  await settle()
+  expect(store.get('hiddenRefs')).toEqual([])
   await ui.unmount()
 })

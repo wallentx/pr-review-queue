@@ -26,6 +26,9 @@ export type Activity = 'in' | 'out'
  */
 export type Choice = { glyph: string; action: string }
 
+/** A hidden pull request, and the query of the session that hid it (the hash its cache file is named with). */
+export type HiddenEntry = { ref: string; query: string }
+
 declare module 'claude-code' {
   interface PluginState {
     'pr-review-queue': {
@@ -41,7 +44,7 @@ declare module 'claude-code' {
       /** The pulse's frame, which steps while any review runs. */
       frame: number
       /** Pull requests the person hid with the row's x, as `owner/repo#N`; also kept in the store. */
-      hidden: Shaped<string[]>
+      hidden: Shaped<HiddenEntry[]>
       /** Whether the rows show their hide control (the header's square). */
       isEditing: boolean
       /** Whether hidden pull requests are listed, struck through, with a restore control. */
