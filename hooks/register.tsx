@@ -25,6 +25,13 @@ const hiddenAtom = atom({ plugin: 'pr-review-queue', key: 'hidden' } as const, [
 const isEditing = atom({ plugin: 'pr-review-queue', key: 'isEditing' } as const, false)
 const isShowingHidden = atom({ plugin: 'pr-review-queue', key: 'isShowingHidden' } as const, false)
 const HIDDEN_KEY = 'hiddenRefs'
+/**
+ * The eye with U+FE0F, which asks for its two-column emoji form. Without it a
+ * terminal draws the one-column text form, which shrinks when the next cell is
+ * not a plain space. The other glyphs have no emoji form, so each is followed
+ * by a Text holding one plain space, outside its button, which the layout keeps.
+ */
+const EYE = '\u{1F441}\u{FE0F}'
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const REF_RE = /([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:#|\/pull\/)(\d+)/g
@@ -459,6 +466,7 @@ export const register: Register = (on, options) => {
         >
           <Text>{editing ? '□' : '◧'}</Text>
         </Button>
+        <Text key="edit-gap"> </Text>
         {editing && hiddenItems.length > 0 ? (
           <Button
             key="show-hidden"
@@ -466,10 +474,10 @@ export const register: Register = (on, options) => {
             plain
             onPress={() => update($, isShowingHidden, v => !v)}
           >
-            {' '}
-            <Text>👁</Text>
+            <Text>{EYE}</Text>
           </Button>
         ) : null}
+        {editing && hiddenItems.length > 0 ? <Text key="eye-gap"> </Text> : null}
         {/* The rest of the line is the toggle, so a click anywhere on it shows or hides the list. */}
         <Button
           key="toggle"
@@ -484,7 +492,6 @@ export const register: Register = (on, options) => {
             await update($, isExpanded, v => !v)
           }}
         >
-          {' '}
           <Text color="warning">
             Reviews waiting: {total}
             {q.isComplete ? '' : ' (partial)'}{' '}
@@ -537,9 +544,10 @@ export const register: Register = (on, options) => {
             <Box key={`row-${ref}`} flexDirection="row">
               {editing ? (
                 <Button key={`hide-${ref}`} label={`Hide ${ref}`} plain onPress={() => setHidden($, ref, true)}>
-                  <Text color="error">⨯</Text>{' '}
+                  <Text color="error">⨯</Text>
                 </Button>
               ) : null}
+              {editing ? <Text key="hide-gap"> </Text> : null}
               <Button
                 key={`pr-${ref}`}
                 plain
@@ -562,8 +570,9 @@ export const register: Register = (on, options) => {
           return (
             <Box key={`hidden-row-${ref}`} flexDirection="row">
               <Button key={`restore-${ref}`} label={`Restore ${ref}`} plain onPress={() => setHidden($, ref, false)}>
-                <Text color="success">↺</Text>{' '}
+                <Text color="success">↺</Text>
               </Button>
+              <Text key="restore-gap"> </Text>
               {body(item, true)}
             </Box>
           )

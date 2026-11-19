@@ -69,6 +69,14 @@ function onlyFile(files: Map<string, string>): any {
 }
 
 /** Lets the check the command started run to its end; each engine call takes several microtasks. */
+/** Each line of the drawing as its text, so a test sees which plain spaces sit between the parts. */
+async function linesOf(ui: { drawn: () => Promise<unknown> }): Promise<string[]> {
+  const textOf = (node: any): string =>
+    typeof node === 'string' ? node : Array.isArray(node?.children) ? node.children.map(textOf).join('') : ''
+  const root = (await ui.drawn()) as any
+  return (root?.children ?? []).map(textOf)
+}
+
 const settle = async () => {
   for (let i = 0; i < 5000; i++) await Promise.resolve()
 }
@@ -367,11 +375,18 @@ test('the square edits the list: the cross hides a row, the eye lists hidden row
   expect((await ui.find({ type: 'Text', text: /Reviews waiting: 1/ }))?.text).toBeTruthy()
   expect(store.get('hiddenRefs')).toEqual(['FarmGPU/fgpu_ansible#207'])
 
+  // The eye is drawn in its two-column emoji form, and a plain space follows each one-column glyph.
+  expect(await ui.find({ type: 'Text', text: '\u{1F441}\u{FE0F}' })).toBeTruthy()
+  const lines = await linesOf(ui)
+  expect(lines[0]).toStartWith('□ \u{1F441}\u{FE0F} Reviews waiting: 1')
+  expect(lines[1]).toStartWith('⨯ ○ ')
+
   // The eye lists hidden rows struck through, each with a restore arrow.
   await ui.press({ key: 'show-hidden' })
   const restore = await ui.find({ type: 'Button', key: RESTORE_A })
   expect(restore).toBeTruthy()
   expect(await ui.find({ type: 'Text', text: '↺' })).toBeTruthy()
+  expect((await linesOf(ui)).some(line => line.startsWith('↺ ○ FarmGPU/fgpu_ansible#207'))).toBe(true)
   expect((await ui.find({ type: 'Text', text: 'fgpu_ansible' }))?.props?.strikethrough).toBe(true)
 
   // The arrow restores the row to the regular list.
