@@ -40,7 +40,10 @@ function sharedCache(
   clock = { now: 1_000_000 },
   isWritable = true,
   env: Record<string, string> = {},
+  store: Map<string, unknown> = new Map(),
 ) {
+  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_, e) => (store.set(e.key, e.value), { value: undefined }))
   on('env.get', (_, e) => ({ value: { HOME: '/home/me', ...env }[e.name] }))
   on('fs.exists', (_, e) => ({ value: files.has(e.path) }))
   on('fs.read', (_, e) => {
@@ -170,9 +173,8 @@ for (const [name, options, argv] of [
 test('a new session starts off even when an older version stored the queue as on', async ($, on) => {
   const ran: string[][] = []
   on('command.register', () => ({ value: { command: 'pr-queue' } }))
-  on('store.get', () => ({ value: true }))
   on('clock.every', () => ({ value: undefined }))
-  sharedCache(on)
+  sharedCache(on, new Map(), { now: 1_000_000 }, true, {}, new Map([['isEnabled', true]]))
   on('process.run', (_, e) => (ran.push([...e.argv]), { value: { exitCode: 0, stdout: EMPTY, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
 
@@ -321,4 +323,59 @@ test('sessions signed in to GitHub differently keep separate results', async ($,
   expect(ran.length).toBe(2)
   expect(files.size).toBe(2)
   for (const text of files.values()) expect(text.includes('account')).toBe(false)
+})
+
+test('the triangle shows the list, the dot reveals the hide control, and unhide brings rows back', async ($, on) => {
+  const store = new Map<string, unknown>()
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  on('clock.every', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  sharedCache(on, new Map(), { now: 1_000_000 }, true, {}, store)
+  on('process.run', () => ({ value: { exitCode: 0, stdout: QUEUE, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await queueSwitch($, 'on')
+  await settle()
+  const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
+
+  // Collapsed, the header ends in a right triangle; expanded, a down triangle.
+  expect((await ui.find({ type: 'Button', key: 'toggle' }))?.props?.label).toBe('▶')
+  await ui.press({ key: 'toggle' })
+  expect((await ui.find({ type: 'Button', key: 'toggle' }))?.props?.label).toBe('▼')
+
+  // The dot reveals [x] on its own row only, and a second press hides it again.
+  expect(await ui.find({ type: 'Button', key: 'hide-FarmGPU/fgpu_ansible#207' })).toBeFalsy()
+  await ui.press({ key: 'dot-FarmGPU/fgpu_ansible#207' })
+  expect(await ui.find({ type: 'Button', key: 'hide-FarmGPU/fgpu_ansible#207' })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: 'hide-FarmGPU/onepass-client#31' })).toBeFalsy()
+  await ui.press({ key: 'dot-FarmGPU/fgpu_ansible#207' })
+  expect(await ui.find({ type: 'Button', key: 'hide-FarmGPU/fgpu_ansible#207' })).toBeFalsy()
+
+  // The x hides the row, drops it from the count, and keeps it hidden in the store.
+  await ui.press({ key: 'dot-FarmGPU/fgpu_ansible#207' })
+  await ui.press({ key: 'hide-FarmGPU/fgpu_ansible#207' })
+  expect(await ui.find({ type: 'Button', key: A })).toBeFalsy()
+  expect(await ui.find({ type: 'Button', key: B })).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /Reviews waiting: 1/ }))?.text).toBeTruthy()
+  expect(store.get('hiddenRefs')).toEqual(['FarmGPU/fgpu_ansible#207'])
+
+  // Unhide brings it back.
+  const answer = (await queueSwitch($, 'unhide')) as { text: string }
+  expect(answer.text).toBe('1 hidden pull request is shown again.')
+  expect(await ui.find({ type: 'Button', key: A })).toBeTruthy()
+  expect(store.get('hiddenRefs')).toEqual([])
+  await ui.unmount()
+})
+
+test('unhide with a pull request shows only that one again', async ($, on) => {
+  const store = new Map<string, unknown>([['hiddenRefs', ['FarmGPU/fgpu_ansible#207', 'FarmGPU/onepass-client#31']]])
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  sharedCache(on, new Map(), { now: 1_000_000 }, true, {}, store)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const answer = (await queueSwitch($, 'unhide FarmGPU/onepass-client#31')) as { text: string }
+  expect(answer.text).toBe('1 hidden pull request is shown again.')
+  expect(store.get('hiddenRefs')).toEqual(['FarmGPU/fgpu_ansible#207'])
 })

@@ -20,6 +20,10 @@ declare module 'claude-code' {
       queue: Shaped<Queue | null>
       statuses: Shaped<Record<string, ReviewStatus>>
       agents: Shaped<Record<string, string>>
+      /** Pull requests the person hid with the row's x, as `owner/repo#N`; also kept in the store. */
+      hidden: Shaped<string[]>
+      /** The pull request whose row shows its hide control, or null for none. */
+      revealed: string | null
     }
   }
 }

@@ -21,6 +21,9 @@ const isExpanded = atom({ plugin: 'pr-review-queue', key: 'isExpanded' } as cons
 const queue = atom({ plugin: 'pr-review-queue', key: 'queue' } as const, null, { shape: 'queue-2' })
 const statuses = atom({ plugin: 'pr-review-queue', key: 'statuses' } as const, {}, { shape: 'statuses-1' })
 const agents = atom({ plugin: 'pr-review-queue', key: 'agents' } as const, {}, { shape: 'agents-1' })
+const hiddenAtom = atom({ plugin: 'pr-review-queue', key: 'hidden' } as const, [], { shape: 'hidden-1' })
+const revealed = atom({ plugin: 'pr-review-queue', key: 'revealed' } as const, null)
+const HIDDEN_KEY = 'hiddenRefs'
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const REF_RE = /([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:#|\/pull\/)(\d+)/g
@@ -152,7 +155,22 @@ async function readShared($: EngineInterface, path: string): Promise<Shared | un
  * that claim at the same moment can both fetch once, which costs one extra
  * AID.review-queue run and nothing else.
  */
+/** Reads the hidden pull requests from the store, which every session shares. */
+async function loadHidden($: EngineInterface): Promise<void> {
+  // A store that cannot be read keeps the list this session already has.
+  const stored = await $.store.get(HIDDEN_KEY).catch(() => undefined)
+  if (stored === undefined) return
+  const refs = Array.isArray(stored) ? stored.filter((r): r is string => typeof r === 'string') : []
+  await update($, hiddenAtom, all => (all.length === refs.length && all.every((r, i) => r === refs[i]) ? all : refs))
+}
+
+async function saveHidden($: EngineInterface, refs: string[]): Promise<void> {
+  await $.store.set(HIDDEN_KEY, refs)
+  await update($, hiddenAtom, () => refs)
+}
+
 async function tick($: EngineInterface): Promise<void> {
+  await loadHidden($)
   // A fetch can outlast TICK_MS, and the claim already names this session, so
   // a second check started meanwhile would fetch again.
   if (isTicking) return
@@ -286,7 +304,7 @@ export const register: Register = (on, options) => {
     const started = await next(e)
     await $.command.register({
       name: COMMAND,
-      description: 'Turn the PR review queue on or off (on, off, or no argument to toggle)',
+      description: 'Turn the PR review queue on or off (on, off, or no argument to toggle); unhide shows hidden pull requests again',
     })
     cachePath = await cachePathOf($, started.cwd)
     // Each session starts off. A hot reload runs this again with the session's
@@ -297,6 +315,21 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: COMMAND }, async ($, e) => {
     const arg = e.args.trim().toLowerCase()
+    if (arg === 'unhide' || arg.startsWith('unhide ')) {
+      const stored = await $.store.get(HIDDEN_KEY)
+      const before = Array.isArray(stored) ? stored.filter((r): r is string => typeof r === 'string') : []
+      // `unhide owner/repo#N` shows one pull request again; `unhide` alone shows them all.
+      const named = new Set(refsIn(e.args).map(r => r.toLowerCase()))
+      const after = named.size > 0 ? before.filter(r => !named.has(r.toLowerCase())) : []
+      await saveHidden($, after)
+      const count = before.length - after.length
+      return {
+        text:
+          count === 0
+            ? 'No hidden pull request matched.'
+            : `${count} hidden pull request${count === 1 ? ' is' : 's are'} shown again.`,
+      }
+    }
     const current = await read($, isEnabled)
     const wanted = arg === 'on' ? true : arg === 'off' ? false : !current
     await update($, isEnabled, () => wanted)
@@ -378,7 +411,8 @@ export const register: Register = (on, options) => {
     }
 
     const status = await read($, statuses)
-    const visible = q.items.filter(item => status[refOf(item)] !== 'posted')
+    const hiddenRefs = new Set(await read($, hiddenAtom))
+    const visible = q.items.filter(item => status[refOf(item)] !== 'posted' && !hiddenRefs.has(refOf(item)))
     const hidden = q.items.length - visible.length
     const total = Math.max(0, q.total - hidden)
     if (total === 0) {
@@ -392,12 +426,7 @@ export const register: Register = (on, options) => {
           Reviews waiting: {total}
           {q.isComplete ? '' : ' (partial)'}{' '}
         </Text>
-        <Button
-          key="toggle"
-          label={expanded ? 'Hide' : 'Show'}
-          hotkey="s"
-          onPress={() => update($, isExpanded, v => !v)}
-        />
+        <Button key="toggle" label={expanded ? '▼' : '▶'} plain onPress={() => update($, isExpanded, v => !v)} />
       </Box>
     )
 
@@ -407,6 +436,7 @@ export const register: Register = (on, options) => {
 
     const columns = e.props.bodyColumns > 0 ? e.props.bodyColumns : 80
     const rows = visible.slice(0, MAX_ROWS)
+    const open = await read($, revealed)
     return (
       <Box flexDirection="column">
         {header}
@@ -414,10 +444,39 @@ export const register: Register = (on, options) => {
           const ref = refOf(item)
           const state = status[ref]
           const [org, repo] = item.repo.split('/')
-          // Marker and spaces take 3 columns; one more keeps the row off the last column.
-          const room = columns - 4 - Array.from(ref).length
+          const isOpen = open === ref
+          // Marker and spaces take 3 columns, `[x] ` 4 more; one more keeps the row off the last column.
+          const room = columns - 4 - (isOpen ? 4 : 0) - Array.from(ref).length
           const title = room >= 8 ? fit(item.title, room) : ''
           return (
+            <Box key={`row-${ref}`} flexDirection="row">
+              {isOpen ? (
+                <Button
+                  key={`hide-${ref}`}
+                  plain
+                  label="x"
+                  onPress={async () => {
+                    const stored = await $.store.get(HIDDEN_KEY)
+                    const before = Array.isArray(stored) ? stored.filter((r): r is string => typeof r === 'string') : []
+                    await saveHidden($, before.includes(ref) ? before : [...before, ref])
+                    await update($, revealed, () => null)
+                  }}
+                >
+                  <Text color="suggestion">[</Text>
+                  <Text color="error">x</Text>
+                  <Text color="suggestion">]</Text>{' '}
+                </Button>
+              ) : null}
+              <Button
+                key={`dot-${ref}`}
+                plain
+                label={state === undefined ? '○' : '●'}
+                onPress={() => update($, revealed, current => (current === ref ? null : ref))}
+              >
+                <Text color={state === 'running' ? 'error' : state === 'done' ? 'success' : 'inactive'}>
+                  {state === undefined ? '○' : '●'}
+                </Text>
+              </Button>
             <Button
               key={`pr-${ref}`}
               plain
@@ -430,15 +489,14 @@ export const register: Register = (on, options) => {
                 )
               }}
             >
-              <Text color={state === 'running' ? 'error' : state === 'done' ? 'success' : 'inactive'}>
-                {state === undefined ? '○' : '●'}
-              </Text>{' '}
+              {' '}
               <Text color="suggestion">{org}</Text>
               <Text dimColor>/</Text>
               <Text color="claude">{repo}</Text>
               <Text color="warning">#{item.number}</Text>
               {title ? ` ${title}` : ''}
             </Button>
+            </Box>
           )
         })}
         {visible.length > rows.length ? (
