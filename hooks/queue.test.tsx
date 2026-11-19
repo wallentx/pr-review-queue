@@ -42,6 +42,8 @@ function sharedCache(
   env: Record<string, string> = {},
   store: Map<string, unknown> = new Map(),
 ) {
+  // The session registers the tool that offers choice buttons.
+  on('tool.register', () => ({ value: { tool: 'mcp__pr-review-queue__offer_choices' } }))
   on('store.get', (_, e) => ({ value: store.get(e.key) }))
   on('store.set', (_, e) => (store.set(e.key, e.value), { value: undefined }))
   on('env.get', (_, e) => ({ value: { HOME: '/home/me', ...env }[e.name] }))
@@ -542,5 +544,60 @@ test('a gh api POST to a pull request reviews endpoint counts as a posted review
     command: 'head=$(gh pr view 207 --json headRefOid -q .headRefOid) && gh api -X POST repos/FarmGPU/fgpu_ansible/pulls/207/reviews --input /tmp/review.json',
   })
   expect(await dotOf(ui)).toEqual({ glyph: '✓', color: 'suggestion' })
+  await ui.unmount()
+})
+
+const OFFER = 'mcp__pr-review-queue__offer_choices'
+const offer = ($: Parameters<Body>[0], ref: string, choices: { glyph: string; action: string }[]) =>
+  $.tool.call({ tool: OFFER, ref, choices } as unknown as Parameters<typeof $.tool.call>[0])
+
+const APPROVE = { glyph: '✓', action: 'Approve FarmGPU/fgpu_ansible#207 with no comments.' }
+const NITS = { glyph: '✓🗩', action: 'Approve FarmGPU/fgpu_ansible#207 and post the two nits as comments.' }
+const BLOCK = { glyph: '⊘', action: 'Request changes on FarmGPU/fgpu_ansible#207 for the missing PDU timeout.' }
+
+test('offered choices show as bracketed buttons after the pull request, and a press sends its action', async ($, on) => {
+  const submitted: { text: string; asUser?: boolean }[] = []
+  on('prompt.submit', (_, e) => {
+    submitted.push({ text: e.text, asUser: (e.origin as { asUser?: boolean } | undefined)?.asUser })
+    return { text: e.text }
+  })
+  const { ui } = await reviewSession($, on)
+
+  // The buttons keep the agent's order, and the title takes whatever room is left.
+  const answer = await offer($, 'FarmGPU/fgpu_ansible#207', [NITS, APPROVE, BLOCK])
+  expect(JSON.stringify(answer)).toContain('shows ✓🗩 ✓ ⊘ on FarmGPU/fgpu_ansible#207')
+  await settle()
+  expect((await linesOf(ui))[1]).toBe('○ FarmGPU/fgpu_ansible#207 [✓🗩 ] [✓] [⊘] Add a P…')
+
+  // The brackets are light blue, the check green, and the request-changes sign red.
+  const button = (await ui.find({ type: 'Button', key: 'choice-⊘-FarmGPU/fgpu_ansible#207' })) as any
+  expect(button.children.map((t: any) => t.props?.color)).toEqual(['#87cefa', 'error', '#87cefa'])
+
+  await ui.press({ key: 'choice-✓🗩-FarmGPU/fgpu_ansible#207' })
+  await settle()
+  expect(submitted).toEqual([{ text: `✓🗩 ${NITS.action}`, asUser: true }])
+  // The press takes the buttons away and gives the title its room back.
+  expect((await linesOf(ui))[1]).toMatch(/^○ FarmGPU\/fgpu_ansible#207 Add a PDU check/)
+  await ui.unmount()
+})
+
+test('posting a review takes its choice buttons away', async ($, on) => {
+  const { ui } = await reviewSession($, on)
+  await offer($, 'FarmGPU/fgpu_ansible#207', [APPROVE, { glyph: '🗩', action: 'Comment on FarmGPU/fgpu_ansible#207.' }])
+  await settle()
+  expect((await linesOf(ui))[1]).toBe('○ FarmGPU/fgpu_ansible#207 [✓] [🗩 ] Add a PDU ch…')
+  await $.tool.call({ tool: 'Bash', command: 'gh pr review 207 --repo FarmGPU/fgpu_ansible --approve' })
+  await settle()
+  expect((await linesOf(ui))[1]).toMatch(/^✓ FarmGPU\/fgpu_ansible#207 Add a PDU check/)
+  await ui.unmount()
+})
+
+test('an offer with a glyph outside the palette is refused, and one for a pull request not listed says so', async ($, on) => {
+  const { ui } = await reviewSession($, on)
+  // A variation selector after a palette glyph is accepted; a glyph outside the palette, or three glyphs, is not.
+  expect(JSON.stringify(await offer($, 'FarmGPU/fgpu_ansible#207', [{ glyph: '✓\uFE0F', action: 'Approve.' }]))).not.toContain('deny')
+  expect(JSON.stringify(await offer($, 'FarmGPU/fgpu_ansible#207', [{ glyph: '👍', action: 'Approve.' }]))).toContain('deny')
+  expect(JSON.stringify(await offer($, 'FarmGPU/fgpu_ansible#207', [{ glyph: '✓🗩🗈', action: 'All.' }]))).toContain('deny')
+  expect(JSON.stringify(await offer($, 'FarmGPU/other#1', [APPROVE]))).toContain('is not showing FarmGPU/other#1')
   await ui.unmount()
 })

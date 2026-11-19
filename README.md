@@ -49,9 +49,24 @@ While `◨` shows and some pull requests are hidden, a green `⟲` appears besid
 
 A failed check shows a red line with the reason, so a failure never reads as an empty queue.
 
+## Choice buttons
+
+After the agent drafts a review, it calls the `offer_choices` tool, which the mod registers, to put buttons after `owner/repo#N`, such as `[✓] [✓🗩 ] [⊘]`. The brackets are light blue. Each button shows one or two glyphs from a fixed palette, and the agent writes what each button does for that review. Clicking a button sends its action to the agent as your own message, starting with its glyph, and removes the buttons. Posting a review also removes them. You can still type an answer instead.
+
+| Glyph | Usual meaning |
+| --- | --- |
+| green `✓` | Approve, accept, or go ahead. |
+| `🗩` | Comment or reply. |
+| `🗈` | A note, a suggested change, or an edit to the draft. |
+| red `⊘` | Block, request changes, or refuse. |
+| `✎` | Revise the draft before anything is posted. |
+| `⊕` | Add something, such as a follow-up in Linear or a request for a stacked pull request. |
+
+The meanings guide the agent and are not enforced. The mod refuses a glyph outside the palette, or more than two glyphs on one button. Most fonts draw `🗩` and `🗈` two cells wide, so each is followed by a space for it to spill into.
+
 ## Review command
 
-`/pr-review-queue:review owner/repo#N` collects the pull request's evidence with `AID.pr`, starts one subagent to review the diff, and shows you a draft review. It posts nothing until you approve the draft, and it then submits the review with `gh pr review`. You can also type the command yourself for a pull request that is not in the queue.
+`/pr-review-queue:review owner/repo#N` collects the pull request's evidence with `AID.pr`, starts one subagent to review the diff, and shows you a draft review with choice buttons on its line. It posts nothing until you pick a button or answer in words. It then submits the review with `gh pr review`, or with a `gh api` POST when the review has inline comments. You can also type the command yourself for a pull request that is not in the queue.
 
 To use your own command, set `reviewCommand` to its name without the slash. The status markers below depend on what that command does, so a replacement needs to start a subagent with `owner/repo#N` in its prompt and post with `gh pr review` or a `gh api` POST to the pull request's reviews for the line to pulse, turn green, and then show a check.
 

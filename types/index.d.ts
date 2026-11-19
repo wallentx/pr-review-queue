@@ -20,6 +20,12 @@ export type ReviewStatus = 'starting' | 'running' | 'done' | 'failed' | 'posted'
 /** What a running reviewer is doing: in, reading input or waiting on a tool; out, writing. */
 export type Activity = 'in' | 'out'
 
+/**
+ * A next step the agent offers on a pull request: the one or two palette glyphs
+ * its button shows, and the instruction a press sends the agent.
+ */
+export type Choice = { glyph: string; action: string }
+
 declare module 'claude-code' {
   interface PluginState {
     'pr-review-queue': {
@@ -40,6 +46,8 @@ declare module 'claude-code' {
       isEditing: boolean
       /** Whether hidden pull requests are listed, struck through, with a restore control. */
       isShowingHidden: boolean
+      /** The choice buttons the agent offered on each pull request, by PR. */
+      choices: Shaped<Record<string, Choice[]>>
     }
   }
 }

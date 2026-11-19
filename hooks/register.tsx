@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Activity, Queue, QueueItem, ReviewStatus } from '../types'
+import type { Activity, Choice, Queue, QueueItem, ReviewStatus } from '../types'
 
 const POLL_MS = 5 * 60 * 1000
 /** How often a session looks at the shared file for a newer result. */
@@ -49,6 +49,48 @@ const RESTORE = '⟲'
  * the button, so the header and every row are keyed.
  */
 const NO_HOVER = { inverse: false } as const
+
+const choicesAtom = atom({ plugin: 'pr-review-queue', key: 'choices' } as const, {}, { shape: 'choices-2' })
+const OFFER_TOOL = 'offer_choices'
+/** The brackets around each choice button. */
+const BRACKET_COLOR = '#87cefa'
+/** The most buttons one pull request shows. */
+const MAX_CHOICES = 5
+/**
+ * The glyphs a choice button can show, each with the meaning it usually
+ * carries. The agent picks the glyphs that fit what it is asking and writes
+ * what each button does, so a meaning here is a convention, not a rule. A glyph
+ * marked wide is drawn by most fonts across two cells while the terminal gives
+ * it one, so a plain space follows it for the glyph to spill into.
+ */
+const PALETTE: Record<string, { color?: string; isWide?: boolean; means: string }> = {
+  '✓': { color: 'success', means: 'approve, accept, or go ahead' },
+  '🗩': { isWide: true, means: 'comment or reply' },
+  '🗈': { isWide: true, means: 'a note, a suggested change, or an edit to the draft' },
+  '⊘': { color: 'error', means: 'block, request changes, or refuse' },
+  '✎': { means: 'revise the draft before anything is posted' },
+  '⊕': { means: 'add something, such as a follow-up in Linear or a request for a stacked pull request' },
+}
+const MAX_GLYPHS = 2
+
+/** A button's glyphs, read from what the agent passed; undefined when any is outside the palette. */
+function glyphsOf(text: string): string[] | undefined {
+  // Variation selectors ask for text or emoji presentation and are not glyphs of their own.
+  const glyphs = Array.from(text.replace(/[\uFE0E\uFE0F\s]/g, ''))
+  return glyphs.length > 0 && glyphs.length <= MAX_GLYPHS && glyphs.every(g => g in PALETTE) ? glyphs : undefined
+}
+
+/** The columns one choice button takes: its brackets, its glyphs, and the space after a wide one. */
+function widthOf(choice: Choice): number {
+  return 2 + (glyphsOf(choice.glyph) ?? []).reduce((n, g) => n + (PALETTE[g]!.isWide ? 2 : 1), 0)
+}
+
+/** Drops one pull request's choice buttons. */
+async function clearChoices($: EngineInterface, refs: readonly string[]): Promise<void> {
+  await update($, choicesAtom, all =>
+    refs.some(ref => ref in all) ? Object.fromEntries(Object.entries(all).filter(([ref]) => !refs.includes(ref))) : all,
+  )
+}
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 const REF_RE = /([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:#|\/pull\/)(\d+)/g
@@ -338,6 +380,11 @@ async function apply($: EngineInterface, result: Queue): Promise<void> {
     await update($, statuses, all =>
       Object.fromEntries(Object.entries(all).filter(([ref]) => listed.has(ref))),
     )
+    await update($, choicesAtom, all =>
+      Object.keys(all).every(ref => listed.has(ref))
+        ? all
+        : Object.fromEntries(Object.entries(all).filter(([ref]) => listed.has(ref))),
+    )
     // A hidden pull request that no longer waits on a review (reviewed, merged,
     // closed) is forgotten. Only a complete list proves it is gone.
     if (result.isComplete) {
@@ -364,6 +411,7 @@ async function stopPolling($: EngineInterface): Promise<void> {
 /** Marks PRs whose review command just ran: yellow until a subagent picks them up. */
 async function markStarting($: EngineInterface, refs: readonly string[]): Promise<void> {
   if (refs.length === 0) return
+  await clearChoices($, refs)
   await update($, statuses, all => {
     const marked: Record<string, ReviewStatus> = { ...all }
     for (const ref of refs) marked[ref] = 'starting'
@@ -435,6 +483,37 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: COMMAND,
       description: 'Turn the PR review queue on or off (on, off, or no argument to toggle); unhide shows hidden pull requests again',
+    })
+    await $.tool.register({
+      name: OFFER_TOOL,
+      description: [
+        'Shows buttons on a pull request in the PR review queue for the next steps you are asking the person to choose between, such as after you draft a review and before you post anything.',
+        `Each button shows one or two glyphs from this palette. The meanings are the usual ones; pick the glyphs that best fit each step, and combine two when a step does both (for example ✓🗩 for approving with comments):`,
+        ...Object.entries(PALETTE).map(([g, p]) => `${g}: ${p.means}`),
+        `Give each button an action: the instruction a press sends you as the person's own message, naming the pull request, such as "Approve owner/repo#N and post the drafted nits as comments." Offer at most ${MAX_CHOICES} buttons, recommended first.`,
+        'After calling this tool, end your reply with one sentence that names your recommended button by its glyph, such as "If you want me to approve the pull request, select ✓, or tell me what to do otherwise." Never ask the person to type a trigger word.',
+      ].join('\n'),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ref: { type: 'string', description: 'The pull request, as owner/repo#N.' },
+          choices: {
+            type: 'array',
+            minItems: 1,
+            maxItems: MAX_CHOICES,
+            items: {
+              type: 'object',
+              properties: {
+                glyph: { type: 'string', description: `One or two glyphs from: ${Object.keys(PALETTE).join(' ')}` },
+                action: { type: 'string', description: "What a press asks you to do, in the person's words." },
+              },
+              required: ['glyph', 'action'],
+            },
+          },
+        },
+        required: ['ref', 'choices'],
+      },
+      isDeferred: false,
     })
     cachePath = await cachePathOf($, started.cwd)
     // Each session starts off. A hot reload runs this again with the session's
@@ -560,8 +639,38 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
     if (ran.isError || ran.deny !== undefined) return ran
-    for (const ref of postedRefs(e.command)) await setStatus($, ref, 'posted')
+    const refs = postedRefs(e.command)
+    for (const ref of refs) await setStatus($, ref, 'posted')
+    // A posted review has been decided, so its choice buttons go away.
+    await clearChoices($, refs)
     return ran
+  })
+
+  // The agent offers the next steps for a review it drafted, as buttons on the pull request's row.
+  on('tool.call', { tool: `mcp__pr-review-queue__${OFFER_TOOL}` }, async ($, e) => {
+    const input = e as unknown as { ref?: unknown; choices?: unknown }
+    const ref = typeof input.ref === 'string' ? refsIn(input.ref)[0] : undefined
+    const raw = Array.isArray(input.choices) ? (input.choices as { glyph?: unknown; action?: unknown }[]) : []
+    const choices: Choice[] = []
+    for (const c of raw.slice(0, MAX_CHOICES)) {
+      const glyphs = typeof c?.glyph === 'string' ? glyphsOf(c.glyph) : undefined
+      const action = typeof c?.action === 'string' ? c.action.trim() : ''
+      if (glyphs === undefined || action === '') {
+        return { deny: `Each choice needs an action and one or two glyphs from ${Object.keys(PALETTE).join(' ')}; ${JSON.stringify(c?.glyph)} is not one.` }
+      }
+      choices.push({ glyph: glyphs.join(''), action })
+    }
+    if (ref === undefined || choices.length === 0) {
+      return { deny: 'Pass ref as owner/repo#N and at least one choice.' }
+    }
+    await update($, choicesAtom, all => ({ ...all, [ref]: choices }))
+    const q = await read($, queue)
+    const isShown = (await read($, isEnabled)) && q?.kind === 'ok' && q.items.some(item => refOf(item) === ref)
+    return {
+      result: isShown
+        ? `The queue shows ${choices.map(c => c.glyph).join(' ')} on ${ref}. End your reply with one sentence naming your recommended button by its glyph.`
+        : `The PR review queue is not showing ${ref}, so the buttons are not visible. Ask the person in words which step to take.`,
+    }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -667,14 +776,20 @@ export const register: Register = (on, options) => {
     const hiddenRows = showingHidden ? hiddenItems.slice(0, Math.max(0, MAX_ROWS - rows.length)) : []
     const notShown = visible.length - rows.length + (showingHidden ? hiddenItems.length - hiddenRows.length : 0)
 
-    /** A row's text: marker, `owner/repo#N` in fixed colors, and the title cut to the room left. */
-    const body = (item: QueueItem, isHidden: boolean) => {
+    const offered = await read($, choicesAtom)
+
+    /** The title cut to the room a row leaves after its marker, its ref, and `used` more columns. */
+    const titleOf = (item: QueueItem, used: number) => {
+      // Marker and spaces take 3 columns, the edit control 2 more; one more keeps the row off the last column.
+      const room = columns - 4 - (editing ? 2 : 0) - Array.from(refOf(item)).length - used
+      return room >= 8 ? fit(item.title, room) : ''
+    }
+
+    /** A row's text: marker, `owner/repo#N` in fixed colors, and the title when `title` is given. */
+    const body = (item: QueueItem, isHidden: boolean, title: string) => {
       const ref = refOf(item)
       const state = status[ref]
       const [org, repo] = item.repo.split('/')
-      // Marker and spaces take 3 columns, the edit control 2 more; one more keeps the row off the last column.
-      const room = columns - 4 - (editing ? 2 : 0) - Array.from(ref).length
-      const title = room >= 8 ? fit(item.title, room) : ''
       // A hidden row is struck through and dim in every part.
       const strike = isHidden ? { strikethrough: true, dimColor: true } : {}
       // An array, since a Button holds strings and Text only, never a fragment's Box.
@@ -697,6 +812,10 @@ export const register: Register = (on, options) => {
         {rows.map(item => {
           const ref = refOf(item)
           const state = status[ref]
+          const choices = offered[ref] ?? []
+          // Each button is followed by the space before the next part.
+          const used = choices.reduce((n, c) => n + widthOf(c) + 1, 0)
+          const title = titleOf(item, used)
           return (
             <Box key={`row-${ref}`} flexDirection="row">
               {editing ? (
@@ -719,8 +838,36 @@ export const register: Register = (on, options) => {
                   )
                 }}
               >
-                {body(item, false)}
+                {body(item, false, choices.length > 0 ? '' : title)}
               </Button>
+              {choices.flatMap(choice => [
+                <Text key={`choice-gap-${choice.glyph}`}> </Text>,
+                <Button
+                  key={`choice-${choice.glyph}-${ref}`}
+                  label={choice.action}
+                  plain
+                  hover={NO_HOVER}
+                  onPress={async () => {
+                    await clearChoices($, [ref])
+                    // The prompt starts a model turn that outlasts the press budget, so it is not awaited.
+                    void $.prompt
+                      .submit({ text: `${choice.glyph} ${choice.action}`, asUser: true })
+                      .catch(err =>
+                        $.ui.toast(`Could not send ${choice.glyph} for ${ref}: ${err instanceof Error ? err.message.slice(0, 80) : 'unknown error'}`),
+                      )
+                  }}
+                >
+                  {[
+                    <Text key="open" color={BRACKET_COLOR}>[</Text>,
+                    ...(glyphsOf(choice.glyph) ?? []).flatMap((glyph, i) => [
+                      <Text key={`glyph-${i}`} color={PALETTE[glyph]!.color}>{glyph}</Text>,
+                      PALETTE[glyph]!.isWide ? <Text key={`spill-${i}`}> </Text> : null,
+                    ]),
+                    <Text key="close" color={BRACKET_COLOR}>]</Text>,
+                  ]}
+                </Button>,
+              ])}
+              {choices.length > 0 && title ? <Text key="title"> {title}</Text> : null}
             </Box>
           )
         })}
@@ -732,7 +879,7 @@ export const register: Register = (on, options) => {
                 <Text color="success" bold>{RESTORE}</Text>
               </Button>
               <Text key="restore-gap"> </Text>
-              {body(item, true)}
+              {body(item, true, titleOf(item, 0))}
             </Box>
           )
         })}
