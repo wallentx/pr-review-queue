@@ -83,6 +83,19 @@ function widthOf(choice: Choice): number {
   return 2 + (glyphsOf(choice.glyph) ?? []).reduce((n, g) => n + (PALETTE[g]!.isWide ? 2 : 1), 0)
 }
 
+/**
+ * The rows the expanded list draws. Hidden rows get the room first while they
+ * are shown, since the person asked to see them to restore one; the waiting
+ * rows take what is left.
+ */
+function layoutOf(items: QueueItem[], hiddenRefs: ReadonlySet<string>, isShowingHiddenRows: boolean) {
+  const visible = items.filter(item => !hiddenRefs.has(refOf(item)))
+  const hiddenItems = items.filter(item => hiddenRefs.has(refOf(item)))
+  const hiddenRows = isShowingHiddenRows ? hiddenItems.slice(0, MAX_ROWS) : []
+  const rows = visible.slice(0, MAX_ROWS - hiddenRows.length)
+  return { visible, hiddenItems, hiddenRows, rows }
+}
+
 /** Drops one pull request's choice buttons. */
 async function clearChoices($: EngineInterface, refs: readonly string[]): Promise<void> {
   await update($, choicesAtom, all =>
@@ -691,8 +704,19 @@ export const register: Register = (on, options) => {
       return { deny: 'Pass ref as owner/repo#N and at least one choice.' }
     }
     await update($, choicesAtom, all => ({ ...all, [ref]: choices }))
+    // Buttons show only on a waiting row the list draws, so a hidden pull
+    // request or one past the row limit gets the words-only answer.
     const q = await read($, queue)
-    const isShown = (await read($, isEnabled)) && q?.kind === 'ok' && q.items.some(item => refOf(item) === ref)
+    const hiddenRefs = new Set((await read($, hiddenAtom)).map(entry => entry.ref))
+    const isShowingHiddenRows = (await read($, isEditing)) && (await read($, isShowingHidden))
+    const isShown =
+      (await read($, isEnabled)) &&
+      q?.kind === 'ok' &&
+      layoutOf(q.items, hiddenRefs, isShowingHiddenRows && q.items.some(item => hiddenRefs.has(refOf(item)))).rows.some(
+        item => refOf(item) === ref,
+      )
+    // A collapsed list draws no rows, so offering buttons opens it.
+    if (isShown) await update($, isExpanded, () => true)
     return {
       result: isShown
         ? `The queue shows ${choices.map(c => c.glyph).join(' ')} on ${ref}. End your reply with one sentence naming your recommended button by its glyph.`
@@ -721,8 +745,10 @@ export const register: Register = (on, options) => {
 
     const status = await read($, statuses)
     const hiddenRefs = new Set((await read($, hiddenAtom)).map(entry => entry.ref))
-    const visible = q.items.filter(item => !hiddenRefs.has(refOf(item)))
-    const hiddenItems = q.items.filter(item => hiddenRefs.has(refOf(item)))
+    const editing = await read($, isEditing)
+    const isShowingHiddenRows =
+      editing && q.items.some(item => hiddenRefs.has(refOf(item))) && (await read($, isShowingHidden))
+    const { visible, hiddenItems, hiddenRows, rows } = layoutOf(q.items, hiddenRefs, isShowingHiddenRows)
     // A posted review stays on its line with a check mark but no longer counts as waiting.
     const posted = visible.filter(item => status[refOf(item)] === 'posted').length
     const total = Math.max(0, q.total - hiddenItems.length - posted)
@@ -736,8 +762,7 @@ export const register: Register = (on, options) => {
     }
 
     const expanded = await read($, isExpanded)
-    const editing = await read($, isEditing)
-    const showingHidden = editing && hiddenItems.length > 0 && (await read($, isShowingHidden))
+    const showingHidden = isShowingHiddenRows
 
     const header = (
       <Box key="header" flexDirection="row">
@@ -800,10 +825,6 @@ export const register: Register = (on, options) => {
     }
 
     const columns = e.props.bodyColumns > 0 ? e.props.bodyColumns : 80
-    // Hidden rows get the room first while they are shown, since the person
-    // asked to see them to restore one; the waiting rows take what is left.
-    const hiddenRows = showingHidden ? hiddenItems.slice(0, MAX_ROWS) : []
-    const rows = visible.slice(0, MAX_ROWS - hiddenRows.length)
     const notShown = visible.length - rows.length + (showingHidden ? hiddenItems.length - hiddenRows.length : 0)
 
     const offered = await read($, choicesAtom)

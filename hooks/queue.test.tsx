@@ -650,3 +650,32 @@ test('hidden rows get room when nine or more pull requests are waiting', async (
   expect(store.get('hiddenRefs')).toEqual([])
   await ui.unmount()
 })
+
+test('offering buttons opens a collapsed list, and a pull request the list does not draw gets the words-only answer', async ($, on) => {
+  const items = Array.from({ length: 11 }, (_, i) => ({ repo: 'acme/app', number: i + 1, title: `Change ${i + 1}`, kind: 'new' }))
+  const many = JSON.stringify({ summary: { total: 11, new: 11, re_review: 0 }, sources: { search: { status: 'ok' } }, complete: true, items })
+  const store = new Map<string, unknown>([['hiddenRefs', ['acme/app#1']]])
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  on('clock.every', () => ({ value: undefined }))
+  sharedCache(on, new Map(), { now: 1_000_000 }, true, {}, store)
+  on('process.run', () => ({ value: { exitCode: 0, stdout: many, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await queueSwitch($, 'on')
+  await settle()
+  const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
+  const approve = (ref: string) => [{ glyph: '✓', action: `Approve ${ref}.` }]
+
+  // acme/app#1 is hidden, and acme/app#11 is the tenth waiting row, past the nine the list draws.
+  expect(JSON.stringify(await offer($, 'acme/app#1', approve('acme/app#1')))).toContain('is not showing acme/app#1')
+  expect(JSON.stringify(await offer($, 'acme/app#11', approve('acme/app#11')))).toContain('is not showing acme/app#11')
+  // The list stays collapsed: no row is drawn.
+  expect(await ui.find({ type: 'Button', key: 'pr-acme/app#2' })).toBeFalsy()
+
+  // A drawn row's buttons open the collapsed list.
+  expect(JSON.stringify(await offer($, 'acme/app#2', approve('acme/app#2')))).toContain('shows ✓ on acme/app#2')
+  await settle()
+  expect((await linesOf(ui))[1]).toMatch(/^○ acme\/app#2 \[✓\]/)
+  await ui.unmount()
+})
