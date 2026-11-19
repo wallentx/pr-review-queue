@@ -4,6 +4,14 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Queue, QueueItem, ReviewStatus } from '../types'
 
 const POLL_MS = 5 * 60 * 1000
+/** How often a session looks at the shared file for a newer result. */
+const TICK_MS = 30 * 1000
+/** How long a claim to fetch holds, longer than the 120 s AID.review-queue timeout. */
+const CLAIM_MS = 150 * 1000
+/** How long a claimer waits before reading its claim back, so a racing claim lands first. */
+const CLAIM_SETTLE_MS = 1000
+/** How long a shared file may fail to parse before a session writes over it. */
+const UNREADABLE_MS = 2 * TICK_MS
 const MAX_ROWS = 9
 const COMMAND = 'pr-queue'
 
@@ -87,10 +95,126 @@ function queueArgv(config: Config): string[] {
   return argv
 }
 
+/** A 32-bit FNV-1a hash in hex, enough to name one cache file per query. */
+function hashOf(text: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193)
+  return (h >>> 0).toString(16).padStart(8, '0')
+}
+
+/**
+ * The file every session running the same query shares. AID.review-queue infers
+ * the owner from the working directory when no workspace is set, so that
+ * directory is part of the query. The variables gh reads to pick the GitHub
+ * account and host are part of it too, so sessions signed in differently never
+ * share a result. They reach the file name only through the hash.
+ */
+async function cachePathOf($: EngineInterface, cwd: string): Promise<string | undefined> {
+  const base = (await $.env.get('XDG_CACHE_HOME')) || ((h => (h ? `${h}/.cache` : undefined))(await $.env.get('HOME')))
+  if (!base) return undefined
+  const identity = [
+    await $.env.get('GH_TOKEN'),
+    await $.env.get('GITHUB_TOKEN'),
+    await $.env.get('GH_HOST'),
+    await $.env.get('GH_CONFIG_DIR'),
+  ]
+  const query = JSON.stringify([queueArgv(config), config.workspace || cwd, identity])
+  return `${base}/pr-review-queue/queue-${hashOf(query)}.json`
+}
+
+/** What sessions with the same query share: the last result and who is fetching the next one. */
+type Shared = { fetchedAt?: number; result?: Queue; claimedBy?: string; claimedAt?: number }
+
 let config: Config = configOf(undefined)
 let timer: { cancel: () => void } | undefined
+let cachePath: string | undefined
+let lastSeen = 0
+let isTicking = false
+let unreadableSince: number | undefined
+const holder = Math.random().toString(36).slice(2)
 
+/** The shared file's content: `{}` when absent, undefined when it does not parse (mid-write, or left truncated). */
+async function readShared($: EngineInterface, path: string): Promise<Shared | undefined> {
+  try {
+    if (!(await $.fs.exists(path))) return {}
+    const data = JSON.parse(await $.fs.read(path))
+    return data && typeof data === 'object' ? (data as Shared) : {}
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * One check of the shared queue. A session uses a result younger than
+ * POLL_MS that any session fetched. When the result is older, one session
+ * claims the fetch and the rest keep showing the old result until the new
+ * one lands. The claim is a write followed by a read-back, so two sessions
+ * that claim at the same moment can both fetch once, which costs one extra
+ * AID.review-queue run and nothing else.
+ */
+async function tick($: EngineInterface): Promise<void> {
+  // A fetch can outlast TICK_MS, and the claim already names this session, so
+  // a second check started meanwhile would fetch again.
+  if (isTicking) return
+  isTicking = true
+  try {
+    await check($)
+  } catch (err) {
+    // A cache directory this session cannot write leaves it checking on its own.
+    const detail = err instanceof Error ? err.message.slice(0, 80) : 'unknown error'
+    cachePath = undefined
+    void $.ui.toast(`The PR review queue cannot use its shared cache (${detail}), so this session checks on its own.`)
+    await poll($)
+  } finally {
+    isTicking = false
+  }
+}
+
+async function check($: EngineInterface): Promise<void> {
+  if (!(await read($, isEnabled))) return
+  const path = cachePath
+  if (path === undefined) return poll($)
+  const now = await $.clock.now()
+  let shared = await readShared($, path)
+  if (shared === undefined) {
+    // Another session may be mid-write, so wait a while. A file that still does
+    // not parse after that was left truncated, and this session writes over it.
+    unreadableSince ??= now
+    if (now - unreadableSince < UNREADABLE_MS) return
+    shared = {}
+  }
+  unreadableSince = undefined
+  if (shared.result && now - (shared.fetchedAt ?? 0) < POLL_MS) {
+    if (shared.fetchedAt !== lastSeen) {
+      lastSeen = shared.fetchedAt ?? 0
+      await apply($, shared.result)
+    }
+    return
+  }
+  if (shared.claimedBy && shared.claimedBy !== holder && now - (shared.claimedAt ?? 0) < CLAIM_MS) return
+  await $.fs.write(path, JSON.stringify({ ...shared, claimedBy: holder, claimedAt: now }))
+  await $.clock.sleep(CLAIM_SETTLE_MS)
+  if ((await readShared($, path))?.claimedBy !== holder) return
+  const result = await fetchQueue($)
+  const fetchedAt = await $.clock.now()
+  await $.fs.write(path, JSON.stringify({ fetchedAt, result } satisfies Shared))
+  lastSeen = fetchedAt
+  await apply($, result)
+}
+
+/**
+ * A check with no shared file, used when neither XDG_CACHE_HOME nor HOME is
+ * set or the cache cannot be written. It runs at most once per POLL_MS,
+ * though the timer fires every TICK_MS.
+ */
 async function poll($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  if (lastSeen !== 0 && now - lastSeen < POLL_MS) return
+  lastSeen = now
+  await apply($, await fetchQueue($))
+}
+
+async function fetchQueue($: EngineInterface): Promise<Queue> {
   let result: Queue
   try {
     // Exit 3 still prints valid JSON, so the exit code is not checked here.
@@ -113,6 +237,11 @@ async function poll($: EngineInterface): Promise<void> {
     const detail = err instanceof Error ? err.message.slice(0, 80) : 'the command failed'
     result = { kind: 'error', reason: `${config.aidPath} did not run (${detail})` }
   }
+  return result
+}
+
+/** Shows a result in this session. */
+async function apply($: EngineInterface, result: Queue): Promise<void> {
   // A check that finishes after the queue was turned off is discarded.
   if (!(await read($, isEnabled))) return
   await update($, queue, () => result)
@@ -127,8 +256,9 @@ async function poll($: EngineInterface): Promise<void> {
 
 function startPolling($: EngineInterface): void {
   timer?.cancel()
-  void poll($)
-  timer = $.clock.every(POLL_MS, () => void poll($))
+  lastSeen = 0
+  void tick($)
+  timer = $.clock.every(TICK_MS, () => void tick($))
 }
 
 async function stopPolling($: EngineInterface): Promise<void> {
@@ -158,9 +288,10 @@ export const register: Register = (on, options) => {
       name: COMMAND,
       description: 'Turn the PR review queue on or off (on, off, or no argument to toggle)',
     })
-    const stored = (await $.store.get('isEnabled')) === true
-    await update($, isEnabled, () => stored)
-    if (stored) startPolling($)
+    cachePath = await cachePathOf($, started.cwd)
+    // Each session starts off. A hot reload runs this again with the session's
+    // state kept, so a queue that was on keeps checking.
+    if (await read($, isEnabled)) startPolling($)
     return started
   })
 
@@ -168,7 +299,6 @@ export const register: Register = (on, options) => {
     const arg = e.args.trim().toLowerCase()
     const current = await read($, isEnabled)
     const wanted = arg === 'on' ? true : arg === 'off' ? false : !current
-    await $.store.set('isEnabled', wanted)
     await update($, isEnabled, () => wanted)
     if (wanted) {
       startPolling($)

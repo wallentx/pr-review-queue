@@ -1,6 +1,6 @@
 {
   "name": "pr-review-queue",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shows the GitHub pull requests waiting on your review above the prompt, and starts a review when you pick one",
   "author": { "name": "wallentx" },
   "repository": "https://github.com/wallentx/pr-review-queue",
