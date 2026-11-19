@@ -340,9 +340,12 @@ test('the triangle shows the list, the dot reveals the hide control, and unhide 
   const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
 
   // Collapsed, the header ends in a right triangle; expanded, a down triangle.
-  expect((await ui.find({ type: 'Button', key: 'toggle' }))?.props?.label).toBe('▶')
+  // The whole line is one button.
+  expect(await ui.find({ type: 'Text', text: '▶' })).toBeTruthy()
+  expect((await ui.find({ type: 'Button', key: 'toggle' }))?.props?.label).toBe('Show the list')
   await ui.press({ key: 'toggle' })
-  expect((await ui.find({ type: 'Button', key: 'toggle' }))?.props?.label).toBe('▼')
+  expect(await ui.find({ type: 'Text', text: '▼' })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: '▶' })).toBeFalsy()
 
   // The dot reveals [x] on its own row only, and a second press hides it again.
   expect(await ui.find({ type: 'Button', key: 'hide-FarmGPU/fgpu_ansible#207' })).toBeFalsy()

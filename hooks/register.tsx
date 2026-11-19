@@ -421,13 +421,19 @@ export const register: Register = (on, options) => {
 
     const expanded = await read($, isExpanded)
     const header = (
-      <Box flexDirection="row">
+      // The whole line is the toggle, so a click anywhere on it shows or hides the list.
+      <Button
+        key="toggle"
+        label={expanded ? 'Hide the list' : 'Show the list'}
+        plain
+        onPress={() => update($, isExpanded, v => !v)}
+      >
         <Text color="warning">
           Reviews waiting: {total}
           {q.isComplete ? '' : ' (partial)'}{' '}
         </Text>
-        <Button key="toggle" label={expanded ? '▼' : '▶'} plain onPress={() => update($, isExpanded, v => !v)} />
-      </Box>
+        <Text>{expanded ? '▼' : '▶'}</Text>
+      </Button>
     )
 
     if (!expanded) {
