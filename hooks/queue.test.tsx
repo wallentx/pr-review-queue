@@ -1,4 +1,5 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
+import type { Mounted } from 'claude-code/testing'
 
 const QUEUE_VIEW = {
   plugin: 'pr-review-queue',
@@ -129,13 +130,11 @@ const turnEnd = ($: Parameters<Body>[0], reason: string, ids: { turnId: string; 
   $.turn.complete({ reason, durationMs: 1, ...ids } as Parameters<typeof $.turn.complete>[0])
 
 /** The color and glyph of the first row's dot. */
-async function dotOf(ui: { drawn: () => Promise<unknown> }): Promise<{ glyph: string; color: string }> {
+async function dotOf(ui: Pick<Mounted, 'find'>) {
   await settle()
-  const root = (await ui.drawn()) as any
-  const row = root.children[1]
-  const button = row.children.find((c: any) => c.type === 'Button')
-  const marker = button.children[0]
-  return { glyph: marker.children.join(''), color: marker.props?.color }
+  const marker = await ui.find({ type: 'Text', text: /^[○●✓]$/ })
+  if (!marker) throw new Error('Missing review status marker')
+  return { glyph: marker.text, color: marker.props.color }
 }
 
 test('a review goes gray, yellow, pulsing, green, then posted with a check that stays listed', async ($, on) => {
@@ -157,9 +156,9 @@ test('a review goes gray, yellow, pulsing, green, then posted with a check that 
   await turnEnd($, 'answer', { turnId: 't1', agentId: 'agent-1' })
   expect(await dotOf(ui)).toEqual({ glyph: '●', color: 'success' })
 
-  // Posting the review keeps the row, marks it with a check, and drops it from the count.
+  // A posted review keeps its check mark and becomes read-only.
   await $.tool.call({ tool: 'Bash', command: 'gh pr review 207 --repo FarmGPU/fgpu_ansible --approve --body-file /tmp/x.md' })
-  expect(await ui.find({ type: 'Button', key: A })).toBeTruthy()
+  expect(await ui.find({ type: 'Button', key: A })).toBeFalsy()
   expect(await dotOf(ui)).toEqual({ glyph: '✓', color: 'suggestion' })
   expect((await ui.find({ type: 'Text', text: /Reviews waiting: 1/ }))?.text).toBeTruthy()
   await ui.unmount()
@@ -422,7 +421,7 @@ test('sessions signed in to GitHub differently keep separate results', async ($,
   for (const text of files.values()) expect(text.includes('account')).toBe(false)
 })
 
-test('the square edits the list: the cross hides a row, the circle arrow lists hidden rows and restores one', async ($, on) => {
+test('the sidebar eyes toggle visibility in place and hidden rows disappear when the controls close', async ($, on) => {
   const store = new Map<string, unknown>()
   on('command.register', () => ({ value: { command: 'pr-queue' } }))
   on('clock.every', () => ({ value: undefined }))
@@ -435,57 +434,52 @@ test('the square edits the list: the cross hides a row, the circle arrow lists h
   await queueSwitch($, 'on')
   await settle()
   const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
-  const HIDE_A = 'hide-FarmGPU/fgpu_ansible#207'
-  const HIDE_B = 'hide-FarmGPU/onepass-client#31'
-  const RESTORE_A = 'restore-FarmGPU/fgpu_ansible#207'
-
-  // Collapsed: a half-filled square, then the count and a right triangle.
-  expect(await ui.find({ type: 'Text', text: '◧' })).toBeTruthy()
+  const eyeA = 'visibility-FarmGPU/fgpu_ansible#207'
+  const eyeB = 'visibility-FarmGPU/onepass-client#31'
+  expect((await ui.find({ type: 'Text', text: '' }))?.props?.bold).toBe(true)
   expect(await ui.find({ type: 'Text', text: '▶' })).toBeTruthy()
-
-  // The square expands the list and puts a cross on every row.
   await ui.press({ key: 'edit' })
-  expect(await ui.find({ type: 'Text', text: '◨' })).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: '' }))?.props?.bold).toBe(true)
   expect(await ui.find({ type: 'Text', text: '▼' })).toBeTruthy()
-  expect(await ui.find({ type: 'Button', key: HIDE_A })).toBeTruthy()
-  expect(await ui.find({ type: 'Button', key: HIDE_B })).toBeTruthy()
-  // No pull request is hidden yet, so the header has no arrow.
-  expect(await ui.find({ type: 'Button', key: 'show-hidden' })).toBeFalsy()
+  expect(await ui.findAll({ type: 'Text', text: '' })).toHaveLength(2)
+  expect((await ui.find({ type: 'Button', key: eyeA }))?.props?.label).toBe('Hide FarmGPU/fgpu_ansible#207')
 
-  // The square again removes the crosses and keeps the list open.
-  await ui.press({ key: 'edit' })
-  expect(await ui.find({ type: 'Button', key: HIDE_A })).toBeFalsy()
-  expect(await ui.find({ type: 'Button', key: A })).toBeTruthy()
-
-  // A cross hides its row in the store and drops it from the count.
-  await ui.press({ key: 'edit' })
-  await ui.press({ key: HIDE_A })
+  // A hidden row stays in its original position and its eye remains clickable.
+  await ui.press({ key: eyeA })
+  let lines = await linesOf(ui)
+  expect(lines[0]).toStartWith(' Reviews waiting: 1')
+  expect(lines[1]).toStartWith(' ○ FarmGPU/fgpu_ansible#207 ')
+  expect(lines[2]).toStartWith(' ○ FarmGPU/onepass-client#31 ')
+  const eyes = await ui.findAll({ type: 'Text', text: /^[]$/ })
+  expect(eyes).toHaveLength(2)
+  for (const eye of eyes) expect(eye.props?.bold).toBeFalsy()
+  expect((await ui.find({ type: 'Text', text: /○ FarmGPU\/fgpu_ansible#207/ }))?.props).toMatchObject({ color: 'inactive', strikethrough: true })
+  expect((await ui.find({ type: 'Button', key: eyeA }))?.props?.label).toBe('Show FarmGPU/fgpu_ansible#207')
   expect(await ui.find({ type: 'Button', key: A })).toBeFalsy()
-  expect((await ui.find({ type: 'Text', text: /Reviews waiting: 1/ }))?.text).toBeTruthy()
   expect((store.get('hiddenRefs') as { ref: string }[]).map(entry => entry.ref)).toEqual(['FarmGPU/fgpu_ansible#207'])
 
-  // A plain space follows each control glyph.
-  const lines = await linesOf(ui)
-  expect(lines[0]).toStartWith('◨ ⟲ Reviews waiting: 1')
-  expect(lines[1]).toStartWith('⨯ ○ ')
-
-  // The header's arrow lists hidden rows struck through, each with its own green arrow.
-  await ui.press({ key: 'show-hidden' })
-  const restore = await ui.find({ type: 'Button', key: RESTORE_A })
-  expect(restore).toBeTruthy()
-  const arrows = await ui.findAll({ type: 'Text', text: '⟲' })
-  expect(arrows).toHaveLength(2)
-  for (const arrow of arrows) expect(arrow.props).toMatchObject({ color: 'success', bold: true })
-  expect((await linesOf(ui)).some(line => line.startsWith('⟲ ○ FarmGPU/fgpu_ansible#207'))).toBe(true)
-  expect((await ui.find({ type: 'Text', text: 'fgpu_ansible' }))?.props?.strikethrough).toBe(true)
-
-  // The arrow restores the row to the regular list.
-  await ui.press({ key: RESTORE_A })
+  await ui.press({ key: eyeA })
   expect(await ui.find({ type: 'Button', key: A })).toBeTruthy()
-  expect(await ui.find({ type: 'Button', key: RESTORE_A })).toBeFalsy()
-  expect(await ui.find({ type: 'Button', key: 'show-hidden' })).toBeFalsy()
-  expect((await ui.find({ type: 'Text', text: /Reviews waiting: 2/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: 'fgpu_ansible' }))?.props?.color).toBe('claude')
+  expect(await ui.find({ type: 'Text', text: /○ FarmGPU\/fgpu_ansible#207/ })).toBeFalsy()
+  expect(await ui.findAll({ type: 'Text', text: '' })).toHaveLength(2)
   expect(store.get('hiddenRefs')).toEqual([])
+
+  await ui.press({ key: eyeA })
+  await ui.press({ key: 'edit' })
+  lines = await linesOf(ui)
+  expect(lines[0]).toStartWith(' Reviews waiting: 1')
+  expect(lines).toHaveLength(2)
+  expect(lines[1]).toStartWith('○ FarmGPU/onepass-client#31 ')
+  expect(await ui.find({ type: 'Button', key: eyeB })).toBeFalsy()
+
+  await ui.press({ key: 'edit' })
+  expect((await linesOf(ui))[1]).toStartWith(' ○ FarmGPU/fgpu_ansible#207 ')
+  await ui.press({ key: eyeA })
+  await ui.press({ key: 'edit' })
+  lines = await linesOf(ui)
+  expect(lines[0]).toStartWith(' Reviews waiting: 2')
+  expect(lines[1]).toStartWith('○ FarmGPU/fgpu_ansible#207 ')
   await ui.unmount()
 })
 
@@ -518,7 +512,9 @@ test('a queue whose every pull request is hidden still draws its line', async ($
   const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /Reviews waiting: 0/ }))?.text).toBeTruthy()
   await ui.press({ key: 'edit' })
-  expect(await ui.find({ type: 'Button', key: 'show-hidden' })).toBeTruthy()
+  expect(await ui.findAll({ type: 'Text', text: '' })).toHaveLength(2)
+  await ui.press({ key: 'visibility-FarmGPU/fgpu_ansible#207' })
+  expect(await ui.find({ type: 'Button', key: A })).toBeTruthy()
   await ui.unmount()
 })
 
@@ -555,6 +551,70 @@ const offer = ($: Parameters<Body>[0], ref: string, choices: { glyph: string; ac
 const APPROVE = { glyph: '✓', action: 'Approve FarmGPU/fgpu_ansible#207 with no comments.' }
 const NITS = { glyph: '✓🗩', action: 'Approve FarmGPU/fgpu_ansible#207 and post the two nits as comments.' }
 const BLOCK = { glyph: '⊘', action: 'Request changes on FarmGPU/fgpu_ansible#207 for the missing PDU timeout.' }
+
+test('each clickable control has its own brightness pulse before any review starts', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.store(on)
+  on('config.set', (_, e) => ({ value: e.value }))
+  on('env.get', () => ({ value: undefined }))
+  on('tool.register', () => ({ value: { tool: 'mcp__pr-review-queue__offer_choices' } }))
+  on('command.register', () => ({ value: { command: 'pr-queue' } }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: QUEUE, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await queueSwitch($, 'on')
+  await clock.settle()
+  const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
+  await ui.press({ key: 'edit' })
+  await offer($, 'FarmGPU/fgpu_ansible#207', [APPROVE, BLOCK])
+
+  const tree = (await ui.drawn()) as any
+  const buttons = tree.children.flatMap((row: any) => row.children.filter((node: any) => node.type === 'Button'))
+  const scopes = buttons.map((button: any) => button.hover.scope)
+  expect(buttons).toHaveLength(8) // Two header controls, two eyes, two PRs, two review actions.
+  expect(new Set(scopes).size).toBe(buttons.length)
+  for (const button of buttons) {
+    expect(button.hover.inverse).toBe(false)
+    for (const span of button.children.filter((node: any) => node.children?.join('').trim())) {
+      expect(span.hover.scope).toBe(button.hover.scope)
+    }
+  }
+  const label = async () => {
+    const root = (await ui.drawn()) as any
+    return root.children[0].children.find((node: any) => node.props?.key === 'toggle').children[0]
+  }
+  const shades: string[] = []
+  for (let i = 0; i <= 8; i++) {
+    const count = await label()
+    expect(count.props.color).toBe('warning')
+    shades.push(count.hover.color)
+    if (i < 8) await clock.advance(250)
+  }
+  expect(new Set(shades).size).toBe(5)
+  expect(shades[8]).toBe(shades[0])
+
+  await ui.press({ key: 'visibility-FarmGPU/fgpu_ansible#207' })
+  const hiddenRow = ((await ui.drawn()) as any).children[1]
+  expect(hiddenRow.children.filter((node: any) => node.type === 'Button')).toHaveLength(1)
+  const hiddenText = hiddenRow.children.find((node: any) => node.props?.strikethrough)
+  expect(hiddenText).toBeTruthy()
+  expect(hiddenText.hover).toBeUndefined()
+  await queueSwitch($, 'off')
+  await clock.advance(750)
+  await queueSwitch($, 'on')
+  await clock.settle()
+  await ui.press({ key: 'edit' })
+  expect((await label()).hover.color).toBe(shades[8])
+
+  // An ANSI theme pulses its own warning color between normal and dim.
+  await $.config.set({ key: 'theme', previous: 'dark', value: 'dark-ansi', provider: { plugin: 'engine', tier: 'core' }, origin: { kind: 'composer' } })
+  await clock.advance(250)
+  const native = (await label()).hover
+  await clock.advance(1000)
+  expect(native.color).toBe('warning')
+  expect((await label()).hover).toMatchObject({ color: 'warning', dimColor: !native.dimColor })
+  await ui.unmount()
+})
 
 test('offered choices show as bracketed buttons after the pull request, and a press sends its action', async ($, on) => {
   const submitted: { text: string; asUser?: boolean }[] = []
@@ -629,7 +689,7 @@ test('the list stays drawn after every listed pull request was posted', async ($
   await ui.unmount()
 })
 
-test('hidden rows get room when nine or more pull requests are waiting', async ($, on) => {
+test('a hidden row beyond the nine-row limit keeps its place while its eye is toggled', async ($, on) => {
   const items = Array.from({ length: 10 }, (_, i) => ({ repo: 'acme/app', number: i + 1, title: `Change ${i + 1}`, kind: 'new' }))
   const many = JSON.stringify({ summary: { total: 10, new: 10, re_review: 0 }, sources: { search: { status: 'ok' } }, complete: true, items })
   const store = new Map<string, unknown>([['hiddenRefs', ['acme/app#10']]])
@@ -644,9 +704,14 @@ test('hidden rows get room when nine or more pull requests are waiting', async (
   await settle()
   const ui = await $.ui.mount({ ...QUEUE_VIEW, surface: 'terminal' })
   await ui.press({ key: 'edit' })
-  await ui.press({ key: 'show-hidden' })
-  await ui.press({ key: 'restore-acme/app#10' })
-  await settle()
+  expect((await linesOf(ui))[9]).toStartWith(' ○ acme/app#10 ')
+  expect(JSON.stringify(await offer($, 'acme/app#10', [APPROVE]))).toContain('is not showing acme/app#10')
+  expect(JSON.stringify(await offer($, 'acme/app#9', [APPROVE]))).toContain('is not showing acme/app#9')
+  await ui.press({ key: 'visibility-acme/app#10' })
+  expect((await linesOf(ui))[9]).toStartWith(' ○ acme/app#10 ')
+  expect(JSON.stringify(await offer($, 'acme/app#10', [APPROVE]))).toContain('shows ✓ on acme/app#10')
+  await ui.press({ key: 'edit' })
+  expect((await linesOf(ui))[9]).toStartWith('○ acme/app#9 ')
   expect(store.get('hiddenRefs')).toEqual([])
   await ui.unmount()
 })

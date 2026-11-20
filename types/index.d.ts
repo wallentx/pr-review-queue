@@ -41,14 +41,12 @@ declare module 'claude-code' {
       activity: Shaped<Record<string, Activity>>
       /** The main turn that runs each starting PR's review command, by PR. */
       commandTurns: Shaped<Record<string, string>>
-      /** The pulse's frame, which steps while any review runs. */
+      /** Animation frame for clickable text on hover and running review markers. */
       frame: number
-      /** Pull requests the person hid with the row's x, as `owner/repo#N`; also kept in the store. */
+      /** Pull requests hidden with their visibility controls, also kept in the shared store. */
       hidden: Shaped<HiddenEntry[]>
-      /** Whether the rows show their hide control (the header's square). */
-      isEditing: boolean
-      /** Whether hidden pull requests are listed, struck through, with a restore control. */
-      isShowingHidden: boolean
+      /** Hidden refs given a slot when the visibility controls opened, or null while closed. */
+      hiddenAtEditStart: Shaped<string[] | null>
       /** The choice buttons the agent offered on each pull request, by PR. */
       choices: Shaped<Record<string, Choice[]>>
     }
