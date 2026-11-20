@@ -1,0 +1,231 @@
+name: Release
+
+# Every merge to main raises the version in plugin.json, tags it, and
+# publishes a GitHub release, so `claude plugin update` sees a new version.
+# The bump comes from the conventional commit types since the last tag: a
+# breaking change (`type!:` or a `BREAKING CHANGE:` footer) is major, `feat` is
+# minor, and any other change is patch.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump. auto reads the commit types since the last release.
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+
+permissions:
+  actions: read
+  attestations: read
+  checks: read
+  contents: read
+  deployments: read
+  discussions: read
+  issues: read
+  packages: read
+  pages: read
+  pull-requests: read
+  repository-projects: read
+  statuses: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Bump version and publish release
+    # A release commit pushed by hand is already a release. The workflow's own
+    # pushes use GITHUB_TOKEN, which starts no new run.
+    if: >-
+      github.ref == 'refs/heads/main'
+      && !startsWith(github.event.head_commit.message, 'chore(release): v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      attestations: read
+      checks: read
+      contents: write
+      deployments: read
+      discussions: read
+      issues: read
+      packages: read
+      pages: read
+      pull-requests: read
+      repository-projects: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      MANIFEST: .claude-plugin/plugin.json
+    steps:
+      # The branch's tip, not the pushed commit, so a run that starts after a
+      # newer push, or a rerun after a release commit, sees the latest tag.
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Actions Toolbox
+        uses: wallentx/gh-actions/composite/actions-toolbox@main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          checkout: false
+
+      - name: Resolve the next version
+        id: version
+        shell: bash
+        env:
+          INPUT_BUMP: ${{ github.event_name == 'workflow_dispatch' && inputs.bump || 'auto' }}
+        run: |
+          set -euo pipefail
+
+          semver_re='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          current=$(jq -r .version "$MANIFEST")
+          [[ $current =~ $semver_re ]] || {
+            printf '%s has version %s, which is not MAJOR.MINOR.PATCH\n' "$MANIFEST" "$current" >&2
+            exit 1
+          }
+
+          # The last release is the newest vX.Y.Z tag in this branch's history.
+          # Other tags do not count. Until the first release tag exists, the
+          # manifest's version is the last release.
+          release_tag_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          latest=''
+          while IFS= read -r tag; do
+            [[ $tag =~ $release_tag_re ]] && latest=$tag
+          done < <(git tag --merged HEAD --list 'v*' --sort=version:refname)
+          range=${latest:+${latest}..}HEAD
+
+          bump=$INPUT_BUMP
+          if [[ $bump == auto ]]; then
+            bump=''
+            breaking_re='^[A-Za-z]+(\([^)]*\))?!:'
+            feat_re='^feat(\([^)]*\))?:'
+            while IFS= read -r -d '' message; do
+              subject=${message%%$'\n'*}
+              # A merge commit carries the pull request's title as its first body line.
+              if [[ $subject == 'Merge pull request '* || $subject == 'Merge branch '* ]]; then
+                body=${message#*$'\n\n'}
+                subject=${body%%$'\n'*}
+              fi
+              [[ $subject == 'chore(release): '* ]] && continue
+              if [[ $subject =~ $breaking_re || $message == *$'\n'BREAKING[\ -]CHANGE:* ]]; then
+                bump=major
+                break
+              fi
+              [[ $subject =~ $feat_re ]] && bump=minor
+              : "${bump:=patch}"
+            done < <(git log -z --format=%B "$range")
+          fi
+
+          if [[ -z $bump ]]; then
+            # An earlier run that pushed the tag but failed to publish its release is finished here.
+            if [[ -n $latest ]] && ! gh release view "$latest" >/dev/null 2>&1; then
+              printf 'Tag %s has no GitHub release, so this run publishes it.\n' "$latest"
+              {
+                printf 'skip=false\n'
+                printf 'version=%s\n' "${latest#v}"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            printf 'No changes since %s, so there is nothing to release.\n' "${latest:-the start}"
+            printf 'skip=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          next_of() { # version bump -> next version
+            local major minor patch
+            IFS=. read -r major minor patch <<<"${1#v}"
+            case $2 in
+              major) printf '%d.0.0\n' "$((major + 1))" ;;
+              minor) printf '%d.%d.0\n' "$major" "$((minor + 1))" ;;
+              patch) printf '%d.%d.%d\n' "$major" "$minor" "$((patch + 1))" ;;
+            esac
+          }
+
+          if [[ -n $latest ]]; then
+            # The toolbox counts from the newest tag of any kind, so its next
+            # versions are used only when that tag is this release tag.
+            version=''
+            if [[ ${GH_LATEST_TAG:-} == "$latest" ]]; then
+              next_var=GH_NEXT_${bump^^}
+              version=${!next_var:-}
+              version=${version#v}
+            fi
+            [[ -n $version ]] || version=$(next_of "$latest" "$bump")
+          else
+            version=$(next_of "$current" "$bump")
+          fi
+
+          # A version raised by hand in a merged pull request wins when it is higher.
+          if [[ $current != "${latest#v}" && $(printf '%s\n' "$version" "$current" | sort -V | tail -n 1) == "$current" ]]; then
+            version=$current
+          fi
+
+          if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            printf 'Tag v%s already exists\n' "$version" >&2
+            exit 1
+          fi
+
+          printf 'Releasing %s (%s bump from %s)\n' "$version" "$bump" "${latest:-$current}"
+          {
+            printf 'skip=false\n'
+            printf 'version=%s\n' "$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Commit the version, tag it, and publish the release
+        if: steps.version.outputs.skip == 'false'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag=v${VERSION}
+          release_args=("$tag" --verify-tag --title "pr-review-queue ${tag}" --generate-notes)
+
+          # The tag and its commit are already pushed when an earlier run failed to publish the release.
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            gh release create "${release_args[@]}"
+            exit 0
+          fi
+
+          # A newer push to main starts its own run, which releases these changes with its own.
+          git fetch --quiet origin "$GITHUB_REF_NAME"
+          if [[ $(git rev-parse HEAD) != $(git rev-parse FETCH_HEAD) ]]; then
+            printf '::notice::main moved past %s; the run for the newer push releases these changes.\n' "$(git rev-parse HEAD)"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          current=$(jq -r .version "$MANIFEST")
+          if [[ $current != "$VERSION" ]]; then
+            # Only the version line changes, so the rest of the file keeps its layout.
+            manifest=$(<"$MANIFEST")
+            printf '%s\n' "${manifest/\"version\": \"${current}\"/\"version\": \"${VERSION}\"}" > "$MANIFEST"
+            [[ $(jq -r .version "$MANIFEST") == "$VERSION" ]] || {
+              printf 'Could not set the version in %s\n' "$MANIFEST" >&2
+              exit 1
+            }
+            git add "$MANIFEST"
+            git commit --quiet -m "chore(release): ${tag}"
+          fi
+
+          git tag -a "$tag" -m "pr-review-queue ${tag}"
+          git push --atomic origin "HEAD:refs/heads/${GITHUB_REF_NAME}" "refs/tags/${tag}"
+          gh release create "${release_args[@]}"
