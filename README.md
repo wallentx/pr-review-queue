@@ -89,6 +89,10 @@ You set these on the install screen or later in `/config`.
 | `workspace` | empty | An absolute directory to infer the owner from. Empty uses the session's working directory. |
 | `reviewCommand` | `pr-review-queue:review` | The slash command, without its slash, that picking a pull request runs. |
 
+## Releases
+
+Each merge to `main` runs the Release workflow. The workflow reads the conventional commit types since the last `vX.Y.Z` tag and raises the version in `.claude-plugin/plugin.json`. A breaking change, written as `type!:` or with a `BREAKING CHANGE:` footer, raises the major version. A `feat` commit raises the minor version, and any other change raises the patch version. The workflow then commits `chore(release): vX.Y.Z` to `main`, tags it, and publishes a GitHub release with generated notes. `claude plugin update pr-review-queue@pr-review-queue` installs a new version only when this number changes, so pull requests leave the version alone. A version raised by hand in a merged pull request is used when it is higher than the computed one. Running the workflow from the Actions tab with a `bump` of `patch`, `minor`, or `major` overrides the commit types.
+
 ## Development
 
 ```sh
