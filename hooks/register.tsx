@@ -25,7 +25,7 @@ const activity = atom({ plugin: 'pr-review-queue', key: 'activity' } as const, {
 const commandTurns = atom({ plugin: 'pr-review-queue', key: 'commandTurns' } as const, {}, { shape: 'turns-1' })
 const frame = atom({ plugin: 'pr-review-queue', key: 'frame' } as const, 0)
 
-/** How often a running review's dot changes color. */
+/** Frame interval shared by hover highlights and running review markers. */
 const PULSE_MS = 250
 /** How many pulse frames pass between checks of the agent list. */
 const RECONCILE_FRAMES = 8
@@ -34,26 +34,43 @@ const IN_COLORS = ['#e5c07b', '#c9bb93', '#a5b6b3', '#82b2d3', '#61afef', '#82b2
 /** Yellow to red while the model writes: tokens out. */
 const OUT_COLORS = ['#e5c07b', '#e4b17a', '#e3a079', '#e18e77', '#e06c75', '#e18e77', '#e3a079', '#e4b17a']
 const hiddenAtom = atom({ plugin: 'pr-review-queue', key: 'hidden' } as const, [], { shape: 'hidden-2' })
-const isEditing = atom({ plugin: 'pr-review-queue', key: 'isEditing' } as const, false)
-const isShowingHidden = atom({ plugin: 'pr-review-queue', key: 'isShowingHidden' } as const, false)
+const hiddenAtEditStart = atom({ plugin: 'pr-review-queue', key: 'hiddenAtEditStart' } as const, null, { shape: 'edit-1' })
 const HIDDEN_KEY = 'hiddenRefs'
-/**
- * The glyph that lists hidden pull requests and restores one. Each control
- * glyph is followed by a Text holding one plain space, outside its button,
- * since a terminal shrinks a glyph whose next cell is not a plain space.
- */
-const RESTORE = '⟲'
-/**
- * Keeps a button's colors while the pointer is over its row, where the
- * terminal would otherwise invert it. Hover overrides need a keyed Box around
- * the button, so the header and every row are keyed.
- */
-const NO_HOVER = { inverse: false } as const
-
+const EYE = ''
+const EYE_CLOSED = ''
 const choicesAtom = atom({ plugin: 'pr-review-queue', key: 'choices' } as const, {}, { shape: 'choices-2' })
 const OFFER_TOOL = 'offer_choices'
 /** The brackets around each choice button. */
 const BRACKET_COLOR = '#87cefa'
+
+/** Fraction of the background mixed into the foreground over one two-second cycle. */
+const HOVER_FADE = [0.28, 0.24, 0.14, 0.04, 0, 0.04, 0.14, 0.24]
+const HOVER_TONES: Record<string, [number, number]> = {
+  // Claude Code's dark and light foregrounds for the Text colors this queue draws.
+  text: [0xffffff, 0x000000],
+  inactive: [0x999999, 0x666666],
+  warning: [0xffc107, 0x966c1e],
+  suggestion: [0xb1b9f9, 0x5769f7],
+  claude: [0xd77757, 0xd77757],
+  success: [0x4eba65, 0x2c7a39],
+  error: [0xff6b80, 0xab2b3f],
+  [BRACKET_COLOR]: [0x87cefa, 0x87cefa],
+}
+
+function hoverPalette(theme: unknown): Record<string, string[]> | null {
+  // Other themes supply their own colors, including the ANSI and colorblind palettes.
+  if (theme !== undefined && theme !== 'dark' && theme !== 'light') return null
+  const light = theme === 'light'
+  const background = light ? 255 : 0
+  return Object.fromEntries(Object.entries(HOVER_TONES).map(([tone, pair]) => {
+    const rgb = pair[light ? 1 : 0]
+    const channels = [rgb >>> 16, (rgb >>> 8) & 255, rgb & 255]
+    const ramp = HOVER_FADE.map(fade => '#' + channels.map(channel =>
+      Math.round(channel + (background - channel) * fade).toString(16).padStart(2, '0'),
+    ).join(''))
+    return [tone, ramp]
+  }))
+}
 /** The most buttons one pull request shows. */
 const MAX_CHOICES = 5
 /**
@@ -83,17 +100,22 @@ function widthOf(choice: Choice): number {
   return 2 + (glyphsOf(choice.glyph) ?? []).reduce((n, g) => n + (PALETTE[g]!.isWide ? 2 : 1), 0)
 }
 
-/**
- * The rows the expanded list draws. Hidden rows get the room first while they
- * are shown, since the person asked to see them to restore one; the waiting
- * rows take what is left.
- */
-function layoutOf(items: QueueItem[], hiddenRefs: ReadonlySet<string>, isShowingHiddenRows: boolean) {
+/** Keep rows in queue order, including previously hidden PRs that need a slot for restoring. */
+function layoutOf(items: QueueItem[], hiddenRefs: ReadonlySet<string>, hiddenOnOpen: readonly string[] | null) {
   const visible = items.filter(item => !hiddenRefs.has(refOf(item)))
-  const hiddenItems = items.filter(item => hiddenRefs.has(refOf(item)))
-  const hiddenRows = isShowingHiddenRows ? hiddenItems.slice(0, MAX_ROWS) : []
-  const rows = visible.slice(0, MAX_ROWS - hiddenRows.length)
-  return { visible, hiddenItems, hiddenRows, rows }
+  const eligible = hiddenOnOpen === null ? visible : items
+  let rows = eligible.slice(0, MAX_ROWS)
+  if (eligible.length > MAX_ROWS && hiddenOnOpen?.length) {
+    // Use the opening selection so toggling an eye never moves its row under the pointer.
+    const priority = new Set(hiddenOnOpen)
+    const selected = new Set(eligible.filter(item => priority.has(refOf(item))).slice(0, MAX_ROWS))
+    for (const item of eligible) {
+      if (selected.size === MAX_ROWS) break
+      selected.add(item)
+    }
+    rows = eligible.filter(item => selected.has(item))
+  }
+  return { visible, rows, notShown: eligible.length - rows.length }
 }
 
 /** Drops one pull request's choice buttons. */
@@ -250,6 +272,8 @@ let queryKey = ''
 let lastSeen = 0
 let isTicking = false
 let pulse: { cancel: () => void } | undefined
+let reconcileOnPulse = false
+let hoverColors: ReturnType<typeof hoverPalette> | undefined
 let unreadableSince: number | undefined
 const holder = Math.random().toString(36).slice(2)
 
@@ -431,6 +455,7 @@ async function apply($: EngineInterface, result: Queue): Promise<void> {
       if (kept.length !== before.length) await saveHidden($, kept)
     }
   }
+  await syncPulse($)
 }
 
 function startPolling($: EngineInterface): void {
@@ -445,6 +470,8 @@ async function stopPolling($: EngineInterface): Promise<void> {
   timer = undefined
   await update($, queue, () => null)
   await update($, isExpanded, () => false)
+  await update($, hiddenAtEditStart, () => null)
+  await syncPulse($)
 }
 
 /** Marks PRs whose review command just ran: yellow until a subagent picks them up. */
@@ -498,17 +525,21 @@ async function reconcile($: EngineInterface): Promise<void> {
   }
 }
 
-/** Runs the pulse while any review is running, and stops it when none is. */
+/** A single clock drives hover styles whenever the queue has controls, and tracks running reviews. */
 async function syncPulse($: EngineInterface): Promise<void> {
   const isRunning = Object.values(await read($, statuses)).includes('running')
-  if (isRunning && pulse === undefined) {
+  const q = await read($, queue)
+  const hasControls = q?.kind === 'ok' && (q.total > 0 || q.items.length > 0)
+  const needed = isRunning || hasControls
+  reconcileOnPulse = isRunning
+  if (needed && pulse === undefined) {
     let count = 0
     pulse = $.clock.every(PULSE_MS, () => {
       count++
-      void update($, frame, n => (n + 1) % IN_COLORS.length)
-      if (count % RECONCILE_FRAMES === 0) void reconcile($).then(() => syncPulse($))
+      void update($, frame, n => n + 1)
+      if (reconcileOnPulse && count % RECONCILE_FRAMES === 0) void reconcile($).then(() => syncPulse($))
     })
-  } else if (!isRunning && pulse !== undefined) {
+  } else if (!needed && pulse !== undefined) {
     pulse.cancel()
     pulse = undefined
   }
@@ -516,6 +547,12 @@ async function syncPulse($: EngineInterface): Promise<void> {
 
 export const register: Register = (on, options) => {
   config = configOf(options as Record<string, unknown> | undefined)
+
+  on('config.set', { key: 'theme' }, async (_, e, next) => {
+    const result = await next(e)
+    if (result.value !== undefined) hoverColors = hoverPalette(result.value)
+    return result
+  })
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -708,13 +745,11 @@ export const register: Register = (on, options) => {
     // request or one past the row limit gets the words-only answer.
     const q = await read($, queue)
     const hiddenRefs = new Set((await read($, hiddenAtom)).map(entry => entry.ref))
-    const isShowingHiddenRows = (await read($, isEditing)) && (await read($, isShowingHidden))
     const isShown =
+      !hiddenRefs.has(ref) &&
       (await read($, isEnabled)) &&
       q?.kind === 'ok' &&
-      layoutOf(q.items, hiddenRefs, isShowingHiddenRows && q.items.some(item => hiddenRefs.has(refOf(item)))).rows.some(
-        item => refOf(item) === ref,
-      )
+      layoutOf(q.items, hiddenRefs, await read($, hiddenAtEditStart)).rows.some(item => refOf(item) === ref)
     // A collapsed list draws no rows, so offering buttons opens it.
     if (isShown) await update($, isExpanded, () => true)
     return {
@@ -745,77 +780,68 @@ export const register: Register = (on, options) => {
 
     const status = await read($, statuses)
     const hiddenRefs = new Set((await read($, hiddenAtom)).map(entry => entry.ref))
-    const editing = await read($, isEditing)
-    const isShowingHiddenRows =
-      editing && q.items.some(item => hiddenRefs.has(refOf(item))) && (await read($, isShowingHidden))
-    const { visible, hiddenItems, hiddenRows, rows } = layoutOf(q.items, hiddenRefs, isShowingHiddenRows)
+    const hiddenOnOpen = await read($, hiddenAtEditStart)
+    const editing = hiddenOnOpen !== null
+    const { visible, rows, notShown } = layoutOf(q.items, hiddenRefs, hiddenOnOpen)
     // A posted review stays on its line with a check mark but no longer counts as waiting.
     const posted = visible.filter(item => status[refOf(item)] === 'posted').length
-    const total = Math.max(0, q.total - hiddenItems.length - posted)
+    const hiddenCount = q.items.length - visible.length
+    const total = Math.max(0, q.total - hiddenCount - posted)
     const tick = await read($, frame)
     const doing = await read($, activity)
     // A queue whose every pull request is hidden still draws its line, so the
     // hidden ones can be brought back, and so does one whose every pull request
     // was posted, so the checks stay until a later check drops them.
-    if (total === 0 && visible.length === 0 && hiddenItems.length === 0) {
+    if (total === 0 && q.items.length === 0) {
       return next(e)
     }
 
     const expanded = await read($, isExpanded)
-    const showingHidden = isShowingHiddenRows
+    if (hoverColors === undefined) {
+      const settings = await $.config.list().catch(() => [])
+      hoverColors = hoverPalette(settings.find(setting => setting.key === 'theme')?.value)
+    }
+    const palette = hoverColors
+    const phase = tick % HOVER_FADE.length
+    // A short scope names one hit target, even when its label contains several colored Text runs.
+    const hover = (scope: string, tone = 'text') => palette
+      ? { scope, inverse: false, dimColor: false, color: (palette[tone] ?? palette.text!)[phase]! }
+      : { scope, inverse: false, color: tone, dimColor: HOVER_FADE[phase]! >= 0.14 }
+    const editHover = hover('edit')
+    const listHover = hover('list')
 
     const header = (
       <Box key="header" flexDirection="row">
         <Button
           key="edit"
-          label={editing ? 'Stop editing the list' : 'Edit the list'}
+          label={editing ? 'Hide PR visibility controls' : 'Show PR visibility controls'}
           plain
-          hover={NO_HOVER}
+          hover={editHover}
           onPress={async () => {
-            if (editing) {
-              await update($, isEditing, () => false)
-              await update($, isShowingHidden, () => false)
-              return
-            }
-            await update($, isEditing, () => true)
-            await update($, isExpanded, () => true)
+            await update($, hiddenAtEditStart, () => editing ? null : [...hiddenRefs])
+            if (!editing) await update($, isExpanded, () => true)
           }}
         >
-          <Text>{editing ? '◨' : '◧'}</Text>
+          <Text bold hover={editHover}>{editing ? '' : ''}</Text>
         </Button>
         <Text key="edit-gap"> </Text>
-        {editing && hiddenItems.length > 0 ? (
-          <Button
-            key="show-hidden"
-            label={showingHidden ? 'Stop showing hidden pull requests' : 'Show hidden pull requests'}
-            plain
-            hover={NO_HOVER}
-            onPress={() => update($, isShowingHidden, v => !v)}
-          >
-            <Text color="success" bold>{RESTORE}</Text>
-          </Button>
-        ) : null}
-        {editing && hiddenItems.length > 0 ? <Text key="show-hidden-gap"> </Text> : null}
         {/* The rest of the line is the toggle, so a click anywhere on it shows or hides the list. */}
         <Button
           key="toggle"
           label={expanded ? 'Hide the list' : 'Show the list'}
           plain
-          hover={NO_HOVER}
+          hover={listHover}
           onPress={async () => {
             // Collapsing the list also leaves editing, since its controls are on the rows.
-            if (expanded) {
-              await update($, isEditing, () => false)
-              await update($, isShowingHidden, () => false)
-            }
+            if (expanded) await update($, hiddenAtEditStart, () => null)
             await update($, isExpanded, v => !v)
           }}
         >
-          <Text color="warning">
+          <Text color="warning" hover={hover('list', 'warning')}>
             Reviews waiting: {total}
             {q.isComplete ? '' : ' (partial)'}{' '}
           </Text>
-          <Text>{expanded ? '▼' : '▶'}</Text>
+          <Text hover={listHover}>{expanded ? '▼' : '▶'}</Text>
         </Button>
       </Box>
     )
@@ -825,7 +851,6 @@ export const register: Register = (on, options) => {
     }
 
     const columns = e.props.bodyColumns > 0 ? e.props.bodyColumns : 80
-    const notShown = visible.length - rows.length + (showingHidden ? hiddenItems.length - hiddenRows.length : 0)
 
     const offered = await read($, choicesAtom)
 
@@ -836,101 +861,106 @@ export const register: Register = (on, options) => {
       return room >= 8 ? fit(item.title, room) : ''
     }
 
-    /** A row's text: marker, `owner/repo#N` in fixed colors, and the title when `title` is given. */
-    const body = (item: QueueItem, isHidden: boolean, title: string) => {
+    /** A row's marker, reference, and title. */
+    const body = (item: QueueItem, isHidden: boolean, title: string, scope?: string) => {
       const ref = refOf(item)
       const state = status[ref]
+      const marker = state === undefined || state === 'starting' ? '○' : state === 'posted' ? '✓' : '●'
+      if (isHidden) {
+        return <Text key="hidden-pr" color="inactive" strikethrough>{marker} {ref}{title ? ` ${title}` : ''}</Text>
+      }
       const [org, repo] = item.repo.split('/')
-      // A hidden row is struck through and dim in every part.
-      const strike = isHidden ? { strikethrough: true, dimColor: true } : {}
+      const runHover = (tone?: string) => scope === undefined ? undefined : hover(scope, tone)
+      const color = markerColor(state, doing[ref], tick)
       // An array, since a Button holds strings and Text only, never a fragment's Box.
       return [
-        <Text key="marker" {...strike} color={markerColor(state, doing[ref], tick)}>
-          {state === undefined || state === 'starting' ? '○' : state === 'posted' ? '✓' : '●'}
-        </Text>,
-        <Text key="gap" {...strike}> </Text>,
-        <Text key="org" {...strike} color="suggestion">{org}</Text>,
-        <Text key="slash" {...strike} dimColor>/</Text>,
-        <Text key="repo" {...strike} color="claude">{repo}</Text>,
-        <Text key="number" {...strike} color="warning">#{item.number}</Text>,
-        title ? <Text key="title" {...strike}> {title}</Text> : null,
+        <Text key="marker" color={color} hover={runHover(color)}>{marker}</Text>,
+        <Text key="gap"> </Text>,
+        <Text key="org" color="suggestion" hover={runHover('suggestion')}>{org}</Text>,
+        <Text key="slash" dimColor hover={runHover('inactive')}>/</Text>,
+        <Text key="repo" color="claude" hover={runHover('claude')}>{repo}</Text>,
+        <Text key="number" color="warning" hover={runHover('warning')}>#{item.number}</Text>,
+        title ? <Text key="title" hover={runHover()}> {title}</Text> : null,
       ]
     }
 
     return (
       <Box flexDirection="column">
         {header}
-        {rows.map(item => {
+        {rows.map((item, rowIndex) => {
           const ref = refOf(item)
           const state = status[ref]
-          const choices = offered[ref] ?? []
+          const isHidden = hiddenRefs.has(ref)
+          const canStart = !isHidden && (state === undefined || state === 'failed')
+          const prScope = `pr-${rowIndex}`
+          const eyeHover = hover(`eye-${rowIndex}`)
+          const choices = isHidden ? [] : offered[ref] ?? []
           // Each button is followed by the space before the next part.
           const used = choices.reduce((n, c) => n + widthOf(c) + 1, 0)
           const title = titleOf(item, used)
+          const contents = body(item, isHidden, choices.length > 0 ? '' : title, canStart ? prScope : undefined)
           return (
             <Box key={`row-${ref}`} flexDirection="row">
               {editing ? (
-                <Button key={`hide-${ref}`} label={`Hide ${ref}`} plain hover={NO_HOVER} onPress={() => setHidden($, ref, true)}>
-                  <Text color="error">⨯</Text>
+                <Button
+                  key={`visibility-${ref}`}
+                  label={`${isHidden ? 'Show' : 'Hide'} ${ref}`}
+                  plain
+                  hover={eyeHover}
+                  onPress={() => setHidden($, ref, !isHidden)}
+                >
+                  <Text hover={eyeHover}>{isHidden ? EYE_CLOSED : EYE}</Text>
                 </Button>
               ) : null}
-              {editing ? <Text key="hide-gap"> </Text> : null}
-              <Button
-                key={`pr-${ref}`}
-                plain
-                hover={NO_HOVER}
-                onPress={async () => {
-                  // Only a waiting or failed review starts again.
-                  if (state !== undefined && state !== 'failed') return
-                  await markStarting($, [ref])
-                  // The command queues a model turn that outlasts the press budget, so it is not awaited.
-                  void $.command.run({ command: config.reviewCommand, args: ref }).catch(err =>
-                    $.ui.toast(`Could not start the review of ${ref}: ${err instanceof Error ? err.message.slice(0, 80) : 'unknown error'}`),
-                  )
-                }}
-              >
-                {body(item, false, choices.length > 0 ? '' : title)}
-              </Button>
-              {choices.flatMap(choice => [
-                <Text key={`choice-gap-${choice.glyph}`}> </Text>,
+              {editing ? <Text key="visibility-gap"> </Text> : null}
+              {canStart ? (
                 <Button
-                  key={`choice-${choice.glyph}-${ref}`}
-                  label={choice.action}
+                  key={`pr-${ref}`}
                   plain
-                  hover={NO_HOVER}
+                  hover={hover(prScope)}
                   onPress={async () => {
-                    await clearChoices($, [ref])
-                    // The prompt starts a model turn that outlasts the press budget, so it is not awaited.
-                    void $.prompt
-                      .submit({ text: `${choice.glyph} ${choice.action}`, asUser: true })
-                      .catch(err =>
-                        $.ui.toast(`Could not send ${choice.glyph} for ${ref}: ${err instanceof Error ? err.message.slice(0, 80) : 'unknown error'}`),
-                      )
+                    await markStarting($, [ref])
+                    // The command queues a model turn that outlasts the press budget, so it is not awaited.
+                    void $.command.run({ command: config.reviewCommand, args: ref }).catch(err =>
+                      $.ui.toast(`Could not start the review of ${ref}: ${err instanceof Error ? err.message.slice(0, 80) : 'unknown error'}`),
+                    )
                   }}
                 >
-                  {[
-                    <Text key="open" color={BRACKET_COLOR}>[</Text>,
-                    ...(glyphsOf(choice.glyph) ?? []).flatMap((glyph, i) => [
-                      <Text key={`glyph-${i}`} color={PALETTE[glyph]!.color}>{glyph}</Text>,
-                      PALETTE[glyph]!.isWide ? <Text key={`spill-${i}`}> </Text> : null,
-                    ]),
-                    <Text key="close" color={BRACKET_COLOR}>]</Text>,
-                  ]}
-                </Button>,
-              ])}
+                  {contents}
+                </Button>
+              ) : contents}
+              {choices.flatMap((choice, choiceIndex) => {
+                const scope = `choice-${rowIndex}-${choiceIndex}`
+                const bracketHover = hover(scope, BRACKET_COLOR)
+                return [
+                  <Text key={`choice-gap-${choice.glyph}`}> </Text>,
+                  <Button
+                    key={`choice-${choice.glyph}-${ref}`}
+                    label={choice.action}
+                    plain
+                    hover={hover(scope)}
+                    onPress={async () => {
+                      await clearChoices($, [ref])
+                      // The prompt starts a model turn that outlasts the press budget, so it is not awaited.
+                      void $.prompt
+                        .submit({ text: `${choice.glyph} ${choice.action}`, asUser: true })
+                        .catch(err =>
+                          $.ui.toast(`Could not send ${choice.glyph} for ${ref}: ${err instanceof Error ? err.message.slice(0, 80) : 'unknown error'}`),
+                        )
+                    }}
+                  >
+                    {[
+                      <Text key="open" color={BRACKET_COLOR} hover={bracketHover}>[</Text>,
+                      ...(glyphsOf(choice.glyph) ?? []).flatMap((glyph, i) => [
+                        <Text key={`glyph-${i}`} color={PALETTE[glyph]!.color} hover={hover(scope, PALETTE[glyph]!.color)}>{glyph}</Text>,
+                        PALETTE[glyph]!.isWide ? <Text key={`spill-${i}`}> </Text> : null,
+                      ]),
+                      <Text key="close" color={BRACKET_COLOR} hover={bracketHover}>]</Text>,
+                    ]}
+                  </Button>,
+                ]
+              })}
               {choices.length > 0 && title ? <Text key="title"> {title}</Text> : null}
-            </Box>
-          )
-        })}
-        {hiddenRows.map(item => {
-          const ref = refOf(item)
-          return (
-            <Box key={`hidden-row-${ref}`} flexDirection="row">
-              <Button key={`restore-${ref}`} label={`Restore ${ref}`} plain hover={NO_HOVER} onPress={() => setHidden($, ref, false)}>
-                <Text color="success" bold>{RESTORE}</Text>
-              </Button>
-              <Text key="restore-gap"> </Text>
-              {body(item, true, titleOf(item, 0))}
             </Box>
           )
         })}
